@@ -22,6 +22,7 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.session.Session;
@@ -33,6 +34,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * Tests for {@link TurnWindowCompactionStrategy}.
  */
+@SuppressWarnings("removal") // exercises the deprecated branch support
 class TurnWindowCompactionStrategyTests {
 
 	private static final String SESSION_ID = "test-session";
@@ -346,11 +348,75 @@ class TurnWindowCompactionStrategyTests {
 		assertThat(result.compactedEvents().get(2).getMessage().getText()).isEqualTo("u2");
 	}
 
+	@Test
+	void latestSystemMessageIsKeptFirstAndEarlierOnesAreArchived() {
+		TurnWindowCompactionStrategy strategy = TurnWindowCompactionStrategy.builder().maxTurns(1).build();
+		List<SessionEvent> events = new ArrayList<>();
+		events.add(system("Answer in French"));
+		events.addAll(turn("u1", "a1"));
+		events.add(2, system("Answer in German"));
+		events.addAll(turn("u2", "a2"));
+
+		CompactionResult result = strategy.compact(requestWith(events));
+
+		assertThat(result.archivedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("Answer in French", "u1", "a1");
+		assertThat(result.compactedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("Answer in German", "u2", "a2");
+	}
+
+	@Test
+	void subAgentSystemMessageSurvivesWhenItsTurnIsArchived() {
+		TurnWindowCompactionStrategy strategy = TurnWindowCompactionStrategy.builder().maxTurns(1).build();
+		List<SessionEvent> events = new ArrayList<>(turn("u1", "a1"));
+		events.add(1, SessionEvent.builder()
+			.sessionId(SESSION_ID)
+			.branch("orch.researcher")
+			.message(new SystemMessage("Researcher rules"))
+			.build());
+		events.addAll(turn("u2", "a2"));
+
+		CompactionResult result = strategy.compact(requestWith(events));
+
+		assertThat(result.archivedEvents()).extracting(e -> e.getMessage().getText()).containsExactly("u1", "a1");
+		assertThat(result.compactedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("Researcher rules", "u2", "a2");
+	}
+
 	// --- helpers ---
+
+	private SessionEvent system(String text) {
+		return SessionEvent.builder().sessionId(SESSION_ID).message(new SystemMessage(text)).build();
+	}
+
 
 	private List<SessionEvent> turn(String userText, String assistantText) {
 		return List.of(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage(userText)).build(),
 				SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage(assistantText)).build());
+	}
+
+	@Test
+	void compactionWithoutRootUserMessageArchivesNothing() {
+		// Every event is on a sub-agent branch (e.g. a top-level agent whose advisor has a
+		// branch), so there is no root turn to cut at: nothing may be archived.
+		List<SessionEvent> events = new ArrayList<>();
+		for (int i = 1; i <= 6; i++) {
+			events.add(SessionEvent.builder()
+				.sessionId(SESSION_ID)
+				.message(new UserMessage("question " + i))
+				.branch("orch")
+				.build());
+			events.add(SessionEvent.builder()
+				.sessionId(SESSION_ID)
+				.message(new AssistantMessage("answer " + i))
+				.branch("orch")
+				.build());
+		}
+
+		CompactionResult result = TurnWindowCompactionStrategy.builder().maxTurns(1).build().compact(requestWith(events));
+
+		assertThat(result.archivedEvents()).isEmpty();
+		assertThat(result.compactedEvents()).containsExactlyElementsOf(events);
 	}
 
 	@SafeVarargs

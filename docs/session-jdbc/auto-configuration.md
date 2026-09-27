@@ -30,14 +30,11 @@ This single dependency gives you:
 | `JdbcSessionRepository` | `spring-ai-autoconfigure-session-jdbc` |
 | `DefaultSessionService` | `spring-ai-autoconfigure-session` |
 
-No additional bean declarations are required.
-
 ---
 
 ## Schema initialisation
 
-By default, schema initialisation only runs for embedded databases (H2). Control this
-with:
+Control when the bundled DDL script runs with:
 
 ```yaml
 spring:
@@ -68,47 +65,25 @@ Boot's `DatabaseInitializationProperties` and inherits these:
 | `initialize-schema` | `embedded` | When to run the bundled DDL script |
 | `schema` | `classpath:org/springframework/ai/session/jdbc/schema-@@platform@@.sql` | DDL script location; `@@platform@@` is resolved to the detected database platform |
 | `platform` | _(auto-detected)_ | Overrides platform detection used to resolve `@@platform@@` in `schema` |
-| `continue-on-error` | `false` | Whether to continue startup if the DDL script fails |
+| `continue-on-error` | `true` | Whether to continue startup if the DDL script fails (Spring Boot's default for these properties) |
 
 ### Service: `spring.ai.session`
 
 | Property | Default | Description |
 |---|---|---|
 | `time-to-live` | `60d` | Default time-to-live of sessions created by the auto-configured `DefaultSessionService` (any `Duration`, e.g. `2h`, `30d`) |
+| `allow-system-messages` | `false` | Whether a `SystemMessage` may be stored in a session. Disabled by default; see [System Messages](../session-management/system-messages.md) |
 
 ---
 
 ## Overriding the auto-configured beans
 
-Declare your own bean of the relevant type and the auto-configuration backs off
-automatically. The repository auto-configuration backs off for a user-defined
-`SessionRepository` of **any** implementation type.
-
-**Override the repository** (e.g. to supply a custom dialect or transaction manager):
-
-```java
-@Bean
-SessionRepository sessionRepository(DataSource dataSource,
-                                    PlatformTransactionManager txManager) {
-    return JdbcSessionRepository.builder()
-        .dataSource(dataSource)
-        .transactionManager(txManager)
-        .dialect(new PostgresJdbcSessionRepositoryDialect())
-        .build();
-}
-```
-
-**Override the service** (e.g. to wrap it with custom behaviour):
-
-```java
-@Bean
-SessionService sessionService(SessionRepository repository) {
-    return new MyCustomSessionService(repository);
-}
-```
-
 Both auto-configurations use `@ConditionalOnMissingBean` (for `SessionRepository` and
-`SessionService` respectively), so either or both can be overridden independently.
+`SessionService` respectively), so declare your own bean of either type and the
+auto-configuration backs off; either or both can be overridden independently. The
+repository auto-configuration backs off for a user-defined `SessionRepository` of **any**
+implementation type. See [Manual bean setup](index.md#manual-bean-setup) for the builder
+options (explicit dialect, transaction manager, JSON mapper).
 
 ---
 

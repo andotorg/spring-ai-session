@@ -27,6 +27,7 @@ import org.mockito.Answers;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.MessageType;
+import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.content.MediaContent;
@@ -48,6 +49,7 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
  * <p>
  * The LLM call is mocked so tests run without a real AI model.
  */
+@SuppressWarnings("removal") // exercises the deprecated branch support
 class RecursiveSummarizationCompactionStrategyTests {
 
 	private static final String SESSION_ID = "test-session";
@@ -572,6 +574,85 @@ class RecursiveSummarizationCompactionStrategyTests {
 		verifyNoMoreInteractions(this.chatClient);
 	}
 
+	@Test
+	void subAgentSystemMessageIsKeptAndNeverSummarized() {
+		AtomicReference<String> summarizationPrompt = new AtomicReference<>();
+		ChatClient.ChatClientRequestSpec afterUser = mock(ChatClient.ChatClientRequestSpec.class,
+				Answers.RETURNS_DEEP_STUBS);
+		given(afterUser.call().content()).willReturn(SUMMARY_TEXT);
+		given(this.chatClient.prompt().system(anyString()).user(anyString())).willAnswer(invocation -> {
+			summarizationPrompt.set(invocation.getArgument(0));
+			return afterUser;
+		});
+		RecursiveSummarizationCompactionStrategy strategy = RecursiveSummarizationCompactionStrategy
+			.builder(this.chatClient)
+			.maxEventsToKeep(2)
+			.overlapSize(1)
+			.build();
+		List<SessionEvent> events = List.of(user("u1"), system("Researcher rules", "orch.researcher"),
+				assistant("a1"), user("u2"), assistant("a2"));
+
+		CompactionResult result = strategy.compact(contextFor(events));
+
+		assertThat(result.archivedEvents()).extracting(e -> e.getMessage().getText()).containsExactly("u1", "a1");
+		assertThat(result.compactedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("Researcher rules", RecursiveSummarizationCompactionStrategy.DEFAULT_SUMMARY_SHADOW_PROMPT,
+					SUMMARY_TEXT, "u2", "a2");
+		assertThat(summarizationPrompt.get()).contains("u1", "a1").doesNotContain("Researcher rules");
+	}
+
+	@Test
+	void latestStoredSystemMessageIsKeptAndEarlierOneIsArchived() {
+		RecursiveSummarizationCompactionStrategy strategy = RecursiveSummarizationCompactionStrategy
+			.builder(this.chatClient)
+			.maxEventsToKeep(2)
+			.overlapSize(1)
+			.build();
+		List<SessionEvent> events = List.of(system("Answer in French"), user("u1"), assistant("a1"),
+				system("Answer in German"), user("u2"), assistant("a2"));
+
+		CompactionResult result = strategy.compact(contextFor(events));
+
+		assertThat(result.compactedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("Answer in German", RecursiveSummarizationCompactionStrategy.DEFAULT_SUMMARY_SHADOW_PROMPT,
+					SUMMARY_TEXT, "u2", "a2");
+		assertThat(result.archivedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("Answer in French", "u1", "a1");
+	}
+
+	@Test
+	void storedSystemMessageIsKeptFirstAndNeverSummarized() {
+		List<SessionEvent> formatted = new ArrayList<>();
+		RecursiveSummarizationCompactionStrategy strategy = RecursiveSummarizationCompactionStrategy
+			.builder(this.chatClient)
+			.maxEventsToKeep(2)
+			.overlapSize(1)
+			.eventFormatter(e -> {
+				formatted.add(e);
+				return RecursiveSummarizationCompactionStrategy.formatEvent(e);
+			})
+			.build();
+		SessionEvent systemEvent = system("Answer in French");
+		List<SessionEvent> events = List.of(systemEvent, user("u1"), assistant("a1"), user("u2"), assistant("a2"));
+
+		CompactionResult result = strategy.compact(contextFor(events));
+
+		assertThat(result.compactedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("Answer in French", RecursiveSummarizationCompactionStrategy.DEFAULT_SUMMARY_SHADOW_PROMPT,
+					SUMMARY_TEXT, "u2", "a2");
+		assertThat(result.archivedEvents()).extracting(e -> e.getMessage().getText()).containsExactly("u1", "a1");
+		// The event formatter renders everything that goes into the summarization prompt.
+		assertThat(formatted).doesNotContain(systemEvent);
+	}
+
+	private static SessionEvent system(String text) {
+		return SessionEvent.builder().sessionId(SESSION_ID).message(new SystemMessage(text)).build();
+	}
+
+	private static SessionEvent system(String text, String branch) {
+		return SessionEvent.builder().sessionId(SESSION_ID).message(new SystemMessage(text)).branch(branch).build();
+	}
+
 	private static SessionEvent user(String text) {
 		return SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage(text)).build();
 	}
@@ -586,6 +667,31 @@ class RecursiveSummarizationCompactionStrategyTests {
 			events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("msg-" + i)).build());
 		}
 		return events;
+	}
+
+	@Test
+	void compactionWithoutRootUserMessageArchivesNothing() {
+		// Every event is on a sub-agent branch (e.g. a top-level agent whose advisor has a
+		// branch), so there is no root turn to cut at: nothing may be archived.
+		List<SessionEvent> events = new ArrayList<>();
+		for (int i = 1; i <= 6; i++) {
+			events.add(SessionEvent.builder()
+				.sessionId(SESSION_ID)
+				.message(new UserMessage("question " + i))
+				.branch("orch")
+				.build());
+			events.add(SessionEvent.builder()
+				.sessionId(SESSION_ID)
+				.message(new AssistantMessage("answer " + i))
+				.branch("orch")
+				.build());
+		}
+
+		CompactionResult result = RecursiveSummarizationCompactionStrategy.builder(this.chatClient).maxEventsToKeep(4).build().compact(contextFor(events));
+
+		assertThat(result.archivedEvents()).isEmpty();
+		assertThat(result.compactedEvents()).containsExactlyElementsOf(events);
+		verifyNoMoreInteractions(this.chatClient);
 	}
 
 	private CompactionRequest contextFor(List<SessionEvent> events) {

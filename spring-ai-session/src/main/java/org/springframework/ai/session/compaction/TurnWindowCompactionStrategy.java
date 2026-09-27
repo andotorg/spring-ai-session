@@ -18,6 +18,7 @@ package org.springframework.ai.session.compaction;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.ToIntFunction;
 
 import org.springframework.ai.chat.messages.MessageType;
 import org.springframework.ai.session.SessionEvent;
@@ -38,19 +39,23 @@ import org.springframework.util.Assert;
  *
  * <h3>Algorithm</h3>
  * <ol>
- * <li>Strip out synthetic summary events — they are always placed first in the
- * result.</li>
+ * <li>Strip out the latest stored system message of each branch (that agent's system prompt — earlier stored system
+ * messages are superseded and archived; see {@code CompactionUtils#pinnedSystemEvents}) and synthetic
+ * summary events — they are always preserved and placed first in the result.</li>
  * <li>Collect any events that appear before the first user message (rare, but possible
  * for pre-seeded tool state) — these are preserved as preamble.</li>
  * <li>Group the remaining events into turns (each turn starts at a user message).</li>
  * <li>If the turn count is within {@code maxTurns}, return unchanged.</li>
  * <li>Archive the oldest turns until only {@code maxTurns} remain.</li>
- * <li>Return: {@code [synthetic summaries] + [preamble] + [kept turns]}.</li>
+ * <li>Return: {@code [system messages] + [synthetic summaries] + [preamble] + [kept
+ * turns]}.</li>
  * </ol>
  *
  * <h3>No-op condition</h3>
  * <p>
- * If the session has fewer turns than {@code maxTurns}, no events are removed.
+ * If the session has at most {@code maxTurns} turns, no real events are removed. If
+ * superseded stored system messages are present, only those are
+ * archived.
  *
  * @author Christian Tzolov
  * @since 2.0.0
@@ -72,15 +77,20 @@ public final class TurnWindowCompactionStrategy implements CompactionStrategy {
 		this.tokenCountEstimator = tokenCountEstimator;
 	}
 
+	@SuppressWarnings("removal") // branch support is deprecated, see SessionEvent#getBranch()
 	@Override
 	public CompactionResult compact(CompactionRequest request) {
 		Assert.notNull(request, "request must not be null");
 
 		List<SessionEvent> events = request.events();
 
-		// 1. Separate synthetic summary events — always preserved, always first
+		// 1. Separate the kept system messages (latest per branch), superseded ones, synthetic
+		// summary events and the real events
+		List<SessionEvent> pinnedSystem = CompactionUtils.pinnedSystemEvents(events);
+		List<SessionEvent> supersededSystem = CompactionUtils.supersededSystemEvents(events, pinnedSystem);
 		List<SessionEvent> synthetic = events.stream().filter(SessionEvent::isSynthetic).toList();
-		List<SessionEvent> real = events.stream().filter(e -> !e.isSynthetic()).toList();
+		List<SessionEvent> real = CompactionUtils.compactableEvents(events);
+		ToIntFunction<SessionEvent> tokens = e -> this.tokenCountEstimator.estimate(CompactionUtils.formatEvent(e));
 
 		// 2. Collect any preamble events that appear before the first user message
 		// (e.g., pre-seeded tool context). These are kept verbatim.
@@ -99,7 +109,8 @@ public final class TurnWindowCompactionStrategy implements CompactionStrategy {
 
 		// 4. No-op if within budget
 		if (turns.size() <= this.maxTurns) {
-			return new CompactionResult(events, List.of(), 0);
+			return CompactionUtils.unchangedExceptSuperseded(events, pinnedSystem, synthetic, real, supersededSystem,
+					tokens);
 		}
 
 		// 5. Archive oldest turns
@@ -111,15 +122,12 @@ public final class TurnWindowCompactionStrategy implements CompactionStrategy {
 		List<SessionEvent> kept = keptTurns.stream().flatMap(List::stream).toList();
 
 		// 6. Assemble result: [synthetics] + [preamble] + [kept turns]
-		List<SessionEvent> compacted = new ArrayList<>(synthetic);
+		List<SessionEvent> compacted = new ArrayList<>(pinnedSystem);
+		compacted.addAll(synthetic);
 		compacted.addAll(preamble);
 		compacted.addAll(kept);
 
-		int tokensArchived = archived.stream()
-			.mapToInt(e -> this.tokenCountEstimator.estimate(CompactionUtils.formatEvent(e)))
-			.sum();
-
-		return new CompactionResult(compacted, archived, tokensArchived);
+		return CompactionUtils.archiving(events, compacted, archived, supersededSystem, tokens);
 	}
 
 	/**
@@ -128,6 +136,7 @@ public final class TurnWindowCompactionStrategy implements CompactionStrategy {
 	 * grouped with the enclosing root turn. Assumes {@code events} begins with a root user
 	 * message (preamble has already been stripped).
 	 */
+	@SuppressWarnings("removal") // branch support is deprecated, see SessionEvent#getBranch()
 	private static List<List<SessionEvent>> groupIntoTurns(List<SessionEvent> events) {
 		List<List<SessionEvent>> turns = new ArrayList<>();
 		List<SessionEvent> currentTurn = null;
