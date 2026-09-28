@@ -53,12 +53,11 @@ public final class TokenCountTrigger implements CompactionTrigger {
 
 	@Override
 	public boolean shouldCompact(CompactionRequest request) {
-		int totalTokens = request.events()
-			.stream()
-			.map(e -> e.getMessage().getText())
-			.filter(t -> t != null)
-			.mapToInt(this.tokenCountEstimator::estimate)
-			.sum();
+		// Count what is actually sent to the model, the same events the
+		// TokenCountCompactionStrategy budgets (see CompactionUtils#budgetedEvents).
+		int totalTokens = CompactionUtils.budgetedEvents(request.events()).stream()
+				.mapToInt(e -> this.tokenCountEstimator.estimate(CompactionUtils.formatEvent(e)))
+				.sum();
 		return totalTokens >= this.threshold;
 	}
 
@@ -74,17 +73,19 @@ public final class TokenCountTrigger implements CompactionTrigger {
 
 		private int threshold;
 
-		private TokenCountEstimator tokenCountEstimator;
+		private TokenCountEstimator tokenCountEstimator = new JTokkitTokenCountEstimator();
 
 		private Builder() {
 		}
 
 		public Builder threshold(int threshold) {
+			Assert.isTrue(threshold > 0, "threshold must be greater than 0");
 			this.threshold = threshold;
 			return this;
 		}
 
 		public Builder tokenCountEstimator(TokenCountEstimator tokenCountEstimator) {
+			Assert.notNull(tokenCountEstimator, "tokenCountEstimator must not be null");
 			this.tokenCountEstimator = tokenCountEstimator;
 			return this;
 		}

@@ -17,7 +17,10 @@
 package org.springframework.ai.session;
 
 import java.time.Instant;
+import java.util.List;
+import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 import org.jspecify.annotations.Nullable;
 
@@ -49,12 +52,6 @@ import org.springframework.ai.chat.messages.MessageType;
  * </ul>
  *
  * <p>
- * Branch filtering implements the MemGPT / Google ADK isolation rule for multi-agent
- * sessions: an event at branch {@code X} is visible to an agent at branch {@code Y} if
- * {@code X} is {@code null} (a root event), equals {@code Y}, or is a dot-prefix ancestor
- * of {@code Y} (e.g. {@code "orch"} is an ancestor of {@code "orch.researcher"}).
- *
- * <p>
  * Use the static factory methods for common cases or {@link #builder()} for custom
  * combinations:
  *
@@ -63,7 +60,6 @@ import org.springframework.ai.chat.messages.MessageType;
  *     .from(Instant.parse("2025-01-01T00:00:00Z"))
  *     .messageTypes(Set.of(MessageType.USER, MessageType.ASSISTANT))
  *     .excludeSynthetic(true)
- *     .branch("orch.researcher")
  *     .build();
  * }</pre>
  *
@@ -71,11 +67,31 @@ import org.springframework.ai.chat.messages.MessageType;
  * @since 2.0.0
  */
 public record EventFilter(@Nullable Instant from, @Nullable Instant to, @Nullable Set<MessageType> messageTypes,
-		boolean excludeSynthetic, @Nullable Integer lastN, @Nullable String keyword, @Nullable Integer page,
-		@Nullable Integer pageSize, @Nullable String branch, boolean excludeArchived) {
+		boolean excludeSynthetic, @Nullable Integer lastN, @Nullable String keyword,
+		@Nullable List<String> keywords, @Nullable MatchMode matchMode, @Nullable Pattern pattern,
+		@Nullable Integer page, @Nullable Integer pageSize, boolean excludeArchived) {
+
+	/**
+	 * How multiple {@link #keywords()} combine when matching an event's text.
+	 */
+	public enum MatchMode {
+
+		/** Match if the text contains at least one of the keywords. */
+		ANY,
+
+		/** Match only if the text contains all of the keywords. */
+		ALL
+
+	}
 
 	public EventFilter {
-		keyword = (keyword != null && !keyword.isBlank()) ? keyword.toLowerCase() : null;
+		keyword = (keyword != null && !keyword.isBlank()) ? keyword.toLowerCase(Locale.ROOT) : null;
+		keywords = (keywords != null && !keywords.isEmpty()) ? keywords.stream()
+			.filter(k -> k != null && !k.isBlank())
+			.map(k -> k.toLowerCase(Locale.ROOT))
+			.toList() : null;
+		keywords = (keywords != null && keywords.isEmpty()) ? null : keywords;
+		matchMode = (keywords != null) ? (matchMode != null ? matchMode : MatchMode.ANY) : null;
 		messageTypes = (messageTypes != null && !messageTypes.isEmpty()) ? messageTypes : null;
 		if (lastN != null && lastN <= 0) {
 			throw new IllegalArgumentException("lastN must be greater than 0");
@@ -97,13 +113,29 @@ public record EventFilter(@Nullable Instant from, @Nullable Instant to, @Nullabl
 		}
 	}
 
+	/**
+	 * Returns a filter combining this (base) filter with {@code other}, where every
+	 * criterion set on {@code other} takes precedence. The {@code excludeSynthetic} and
+	 * {@code excludeArchived} flags are OR-ed (either side can only narrow the result).
+	 *
+	 * <p>
+	 * The retrieval modifier — {@link #lastN} or {@link #page}/{@link #pageSize} — is
+	 * treated as a single unit: if {@code other} sets either form, it replaces this
+	 * filter's modifier entirely. This lets a per-request paginated search override a base
+	 * {@code lastN} window (and vice versa) instead of failing on the mutually exclusive
+	 * combination.
+	 */
 	public EventFilter merge(EventFilter other) {
+		boolean otherHasRetrievalModifier = other.lastN != null || other.pageSize != null;
+		EventFilter retrieval = otherHasRetrievalModifier ? other : this;
 		return new EventFilter(other.from != null ? other.from : this.from, other.to != null ? other.to : this.to,
 				other.messageTypes != null ? other.messageTypes : this.messageTypes,
-				other.excludeSynthetic || this.excludeSynthetic, other.lastN != null ? other.lastN : this.lastN,
-				other.keyword != null ? other.keyword : this.keyword, other.page != null ? other.page : this.page,
-				other.pageSize != null ? other.pageSize : this.pageSize,
-				other.branch != null ? other.branch : this.branch, other.excludeArchived || this.excludeArchived);
+				other.excludeSynthetic || this.excludeSynthetic, retrieval.lastN,
+				other.keyword != null ? other.keyword : this.keyword,
+				other.keywords != null ? other.keywords : this.keywords,
+				other.matchMode != null ? other.matchMode : this.matchMode,
+				other.pattern != null ? other.pattern : this.pattern, retrieval.page, retrieval.pageSize,
+				other.excludeArchived || this.excludeArchived);
 	}
 
 	/** Default number of results per page used by {@link #keywordSearch(String)}. */
@@ -156,25 +188,32 @@ public record EventFilter(@Nullable Instant from, @Nullable Instant to, @Nullabl
 	}
 
 	/**
-	 * Returns events that are visible to an agent at the given {@code agentBranch}.
+	 * Returns the first page of events whose message text contains, depending on
+	 * {@code matchMode}, any or all of {@code terms} (case-insensitive substring match
+	 * per term). Uses {@link #DEFAULT_PAGE_SIZE}.
+	 */
+	public static EventFilter keywordsSearch(List<String> terms, MatchMode matchMode) {
+		return builder().keywords(terms).matchMode(matchMode).page(0).pageSize(DEFAULT_PAGE_SIZE).build();
+	}
+
+	/**
+	 * Returns the first page of events whose message text matches the given regular
+	 * expression. Uses {@link #DEFAULT_PAGE_SIZE}. Case sensitivity is controlled by the
+	 * caller via {@link Pattern#CASE_INSENSITIVE} on the compiled {@code pattern}.
 	 *
 	 * <p>
-	 * An event is included if its branch is:
-	 * <ul>
-	 * <li>{@code null} — a root event produced before any delegation, visible to all
-	 * agents</li>
-	 * <li>equal to {@code agentBranch} — the agent's own events</li>
-	 * <li>a dot-prefix ancestor of {@code agentBranch} — events from a parent agent (e.g.
-	 * event branch {@code "orch"} is visible to {@code "orch.researcher"})</li>
-	 * </ul>
-	 *
-	 * Peer sub-agents (e.g. {@code "orch.writer"} vs {@code "orch.researcher"}) never see
-	 * each other's events.
-	 * @param agentBranch the dot-separated branch path of the querying agent (e.g.
-	 * {@code "orchestrator.researcher"})
+	 * <strong>Security:</strong> {@code pattern} must be a {@link Pattern} the calling
+	 * <em>code</em> compiled from a fixed or developer-authored expression. Never call
+	 * {@link Pattern#compile(String)} on a string sourced from a user, an LLM tool-call
+	 * argument, or any other untrusted input and pass the result here (or to
+	 * {@link Builder#pattern(Pattern)}) — an attacker-chosen regular expression can exhibit
+	 * catastrophic backtracking (ReDoS) when evaluated against attacker-influenced message
+	 * text such as {@link SessionEvent} content, causing denial of service. This type
+	 * intentionally has no {@code @Tool}-annotated entry point that accepts a raw regex
+	 * string for exactly this reason — keep it that way.
 	 */
-	public static EventFilter forBranch(String agentBranch) {
-		return builder().branch(agentBranch).build();
+	public static EventFilter patternSearch(Pattern pattern) {
+		return builder().pattern(pattern).page(0).pageSize(DEFAULT_PAGE_SIZE).build();
 	}
 
 	/** Returns a new {@link Builder} for constructing a custom {@link EventFilter}. */
@@ -207,24 +246,27 @@ public record EventFilter(@Nullable Instant from, @Nullable Instant to, @Nullabl
 		}
 		if (this.keyword != null) {
 			String text = event.getMessage().getText();
-			if (text == null || !text.toLowerCase().contains(this.keyword)) {
+			if (text == null || !text.toLowerCase(Locale.ROOT).contains(this.keyword)) {
 				return false;
 			}
 		}
-		if (this.branch != null) {
-			String eventBranch = event.getBranch();
-			if (eventBranch != null) {
-				// eventBranch is visible to filterBranch if it is the same branch or an
-				// ancestor (i.e. filterBranch starts with eventBranch + ".")
-				// TODO: what convention to use for branching trees (. or / or something
-				// else)? Should we support wildcards (e.g. "orch.*")?
-				// TODO: Should we support rootEventId for branch?
-				boolean visible = this.branch.equals(eventBranch) || this.branch.startsWith(eventBranch + ".");
-				if (!visible) {
-					return false;
-				}
+		if (this.keywords != null) {
+			String text = event.getMessage().getText();
+			if (text == null) {
+				return false;
 			}
-			// eventBranch == null: root event, visible to all agents
+			String lowerText = text.toLowerCase(Locale.ROOT);
+			boolean matched = (this.matchMode == MatchMode.ALL) ? this.keywords.stream().allMatch(lowerText::contains)
+					: this.keywords.stream().anyMatch(lowerText::contains);
+			if (!matched) {
+				return false;
+			}
+		}
+		if (this.pattern != null) {
+			String text = event.getMessage().getText();
+			if (text == null || !this.pattern.matcher(text).find()) {
+				return false;
+			}
 		}
 		return true;
 	}
@@ -248,11 +290,15 @@ public record EventFilter(@Nullable Instant from, @Nullable Instant to, @Nullabl
 
 		private @Nullable String keyword;
 
+		private @Nullable List<String> keywords;
+
+		private @Nullable MatchMode matchMode;
+
+		private @Nullable Pattern pattern;
+
 		private @Nullable Integer page;
 
 		private @Nullable Integer pageSize;
-
-		private @Nullable String branch;
 
 		private boolean excludeArchived = false;
 
@@ -307,6 +353,41 @@ public record EventFilter(@Nullable Instant from, @Nullable Instant to, @Nullabl
 		}
 
 		/**
+		 * Case-insensitive terms to match against {@code message.getText()}, combined
+		 * according to {@link #matchMode(MatchMode)} (default {@link MatchMode#ANY} if
+		 * left unset while {@code keywords} is set).
+		 */
+		public Builder keywords(@Nullable List<String> keywords) {
+			this.keywords = keywords;
+			return this;
+		}
+
+		/**
+		 * How {@link #keywords(List)} combine — {@link MatchMode#ANY} (at least one term
+		 * present) or {@link MatchMode#ALL} (every term present). Ignored unless
+		 * {@code keywords} is also set.
+		 */
+		public Builder matchMode(@Nullable MatchMode matchMode) {
+			this.matchMode = matchMode;
+			return this;
+		}
+
+		/**
+		 * A compiled regular expression evaluated against {@code message.getText()} via
+		 * {@link Pattern#matcher(CharSequence)}{@code .find()}. Events whose text is
+		 * {@code null} or does not match are excluded.
+		 *
+		 * <p>
+		 * <strong>Security:</strong> see the warning on {@link EventFilter#patternSearch(Pattern)}
+		 * — only pass a {@link Pattern} compiled from a fixed or developer-authored
+		 * expression, never one compiled from untrusted (e.g. LLM tool-call) input.
+		 */
+		public Builder pattern(@Nullable Pattern pattern) {
+			this.pattern = pattern;
+			return this;
+		}
+
+		/**
 		 * Zero-indexed page number for paginated results. Applied after per-event
 		 * filtering in chronological order (oldest first), so page 0 contains the oldest
 		 * matching events. Requires {@link #pageSize(Integer)} to be set.
@@ -317,19 +398,13 @@ public record EventFilter(@Nullable Instant from, @Nullable Instant to, @Nullabl
 		}
 
 		/**
-		 * Number of results per page. Defaults to {@link EventFilter#DEFAULT_PAGE_SIZE}.
+		 * Number of results per page. Enables pagination; {@link #page(Integer)} then
+		 * defaults to {@code 0}. Unset by default (no pagination) — the
+		 * {@link EventFilter#keywordSearch(String)}-style factories use
+		 * {@link EventFilter#DEFAULT_PAGE_SIZE}.
 		 */
 		public Builder pageSize(@Nullable Integer pageSize) {
 			this.pageSize = pageSize;
-			return this;
-		}
-
-		/**
-		 * Restricts results to events visible to the agent at this dot-separated branch
-		 * path. See {@link EventFilter#forBranch(String)} for the full visibility rule.
-		 */
-		public Builder branch(@Nullable String branch) {
-			this.branch = branch;
 			return this;
 		}
 
@@ -346,7 +421,8 @@ public record EventFilter(@Nullable Instant from, @Nullable Instant to, @Nullabl
 		/** Constructs the {@link EventFilter}. */
 		public EventFilter build() {
 			return new EventFilter(this.from, this.to, this.messageTypes, this.excludeSynthetic, this.lastN,
-					this.keyword, this.page, this.pageSize, this.branch, this.excludeArchived);
+					this.keyword, this.keywords, this.matchMode, this.pattern, this.page, this.pageSize,
+					this.excludeArchived);
 		}
 
 	}

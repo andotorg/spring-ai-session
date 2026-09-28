@@ -20,14 +20,18 @@ import java.time.Duration;
 
 import org.junit.jupiter.api.Test;
 
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.session.CreateSessionRequest;
 import org.springframework.ai.session.DefaultSessionService;
 import org.springframework.ai.session.InMemorySessionRepository;
+import org.springframework.ai.session.Session;
 import org.springframework.ai.session.SessionRepository;
 import org.springframework.ai.session.SessionService;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 import static org.mockito.Mockito.mock;
 
 /**
@@ -56,6 +60,26 @@ class SessionServiceAutoConfigurationTests {
 	}
 
 	@Test
+	void sessionServiceBeanIsNotCreatedWithAmbiguousRepositories() {
+		this.contextRunner
+			.withBean("first", SessionRepository.class, () -> InMemorySessionRepository.builder().build())
+			.withBean("second", SessionRepository.class, () -> InMemorySessionRepository.builder().build())
+			.run(context -> {
+				assertThat(context).hasNotFailed();
+				assertThat(context).doesNotHaveBean(SessionService.class);
+			});
+	}
+
+	@Test
+	void sessionServiceUsesPrimaryRepositoryWhenSeveralExist() {
+		SessionRepository primary = InMemorySessionRepository.builder().build();
+		this.contextRunner
+			.withBean("first", SessionRepository.class, () -> primary, bd -> bd.setPrimary(true))
+			.withBean("second", SessionRepository.class, () -> InMemorySessionRepository.builder().build())
+			.run(context -> assertThat(context).hasSingleBean(SessionService.class));
+	}
+
+	@Test
 	void timeToLiveDefaultsTo60Days() {
 		this.contextRunner.withBean(SessionRepository.class, () -> InMemorySessionRepository.builder().build())
 			.run(context -> assertThat(context.getBean(SessionServiceProperties.class).getTimeToLive())
@@ -68,6 +92,32 @@ class SessionServiceAutoConfigurationTests {
 			.withPropertyValues("spring.ai.session.time-to-live=2h")
 			.run(context -> assertThat(context.getBean(SessionServiceProperties.class).getTimeToLive())
 				.isEqualTo(Duration.ofHours(2)));
+	}
+
+	@Test
+	void storingSystemMessagesIsDisabledByDefault() {
+		this.contextRunner.withBean(SessionRepository.class, () -> InMemorySessionRepository.builder().build())
+			.run(context -> {
+				assertThat(context.getBean(SessionServiceProperties.class).isAllowSystemMessages()).isFalse();
+				SessionService service = context.getBean(SessionService.class);
+				Session session = service.create(CreateSessionRequest.builder().userId("alice").build());
+				assertThatIllegalArgumentException()
+					.isThrownBy(() -> service.appendMessage(session.id(), new SystemMessage("Answer in French.")))
+					.withMessageContaining("spring.ai.session.allow-system-messages=true");
+			});
+	}
+
+	@Test
+	void storingSystemMessagesCanBeEnabledWithAProperty() {
+		this.contextRunner.withBean(SessionRepository.class, () -> InMemorySessionRepository.builder().build())
+			.withPropertyValues("spring.ai.session.allow-system-messages=true")
+			.run(context -> {
+				SessionService service = context.getBean(SessionService.class);
+				Session session = service.create(CreateSessionRequest.builder().userId("alice").build());
+				service.appendMessage(session.id(), new SystemMessage("Answer in French."));
+				assertThat(service.getMessages(session.id())).extracting(m -> m.getText())
+					.containsExactly("Answer in French.");
+			});
 	}
 
 	@Test

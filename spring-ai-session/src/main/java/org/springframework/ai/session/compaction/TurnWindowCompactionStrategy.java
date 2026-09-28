@@ -18,6 +18,7 @@ package org.springframework.ai.session.compaction;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.ToIntFunction;
 
 import org.springframework.ai.chat.messages.MessageType;
 import org.springframework.ai.session.SessionEvent;
@@ -38,19 +39,23 @@ import org.springframework.util.Assert;
  *
  * <h3>Algorithm</h3>
  * <ol>
- * <li>Strip out synthetic summary events — they are always placed first in the
- * result.</li>
+ * <li>Strip out the latest stored system message (the system prompt — earlier stored
+ * system messages are superseded and archived; see
+ * {@code CompactionUtils#pinnedSystemEvents}) and synthetic summary events — they are
+ * always preserved, in place.</li>
  * <li>Collect any events that appear before the first user message (rare, but possible
  * for pre-seeded tool state) — these are preserved as preamble.</li>
  * <li>Group the remaining events into turns (each turn starts at a user message).</li>
  * <li>If the turn count is within {@code maxTurns}, return unchanged.</li>
  * <li>Archive the oldest turns until only {@code maxTurns} remain.</li>
- * <li>Return: {@code [synthetic summaries] + [preamble] + [kept turns]}.</li>
+ * <li>Return every event that is not archived, in its original log order.</li>
  * </ol>
  *
  * <h3>No-op condition</h3>
  * <p>
- * If the session has fewer turns than {@code maxTurns}, no events are removed.
+ * If the session has at most {@code maxTurns} turns, no real events are removed. If
+ * superseded stored system messages are present, only those are
+ * archived.
  *
  * @author Christian Tzolov
  * @since 2.0.0
@@ -78,62 +83,51 @@ public final class TurnWindowCompactionStrategy implements CompactionStrategy {
 
 		List<SessionEvent> events = request.events();
 
-		// 1. Separate synthetic summary events — always preserved, always first
+		// 1. Separate the kept system message (the latest), superseded ones, synthetic
+		// summary events and the real events
+		List<SessionEvent> pinnedSystem = CompactionUtils.pinnedSystemEvents(events);
+		List<SessionEvent> supersededSystem = CompactionUtils.supersededSystemEvents(events, pinnedSystem);
 		List<SessionEvent> synthetic = events.stream().filter(SessionEvent::isSynthetic).toList();
-		List<SessionEvent> real = events.stream().filter(e -> !e.isSynthetic()).toList();
+		List<SessionEvent> real = CompactionUtils.compactableEvents(events);
+		ToIntFunction<SessionEvent> tokens = e -> this.tokenCountEstimator.estimate(CompactionUtils.formatEvent(e));
 
-		// 2. Collect any preamble events that appear before the first user message
-		// (e.g., pre-seeded tool context). These are kept verbatim.
-		List<SessionEvent> preamble = new ArrayList<>();
+		// 2. Skip any preamble events that appear before the first user message (e.g.,
+		// pre-seeded tool context). They are kept verbatim, in place.
 		int firstUserIdx = 0;
-		while (firstUserIdx < real.size()
-				&& !(real.get(firstUserIdx).isRootEvent()
-						&& real.get(firstUserIdx).getMessageType() == MessageType.USER)) {
-			preamble.add(real.get(firstUserIdx));
+		while (firstUserIdx < real.size() && !CompactionUtils.isTurnStart(real.get(firstUserIdx))) {
 			firstUserIdx++;
 		}
 		List<SessionEvent> afterPreamble = real.subList(firstUserIdx, real.size());
 
-		// 3. Group into turns — each turn starts at a root-level user message
+		// 3. Group into turns — each turn starts at a user message
 		List<List<SessionEvent>> turns = groupIntoTurns(afterPreamble);
 
 		// 4. No-op if within budget
 		if (turns.size() <= this.maxTurns) {
-			return new CompactionResult(events, List.of(), 0);
+			return CompactionUtils.unchangedExceptSuperseded(events, supersededSystem, tokens);
 		}
 
 		// 5. Archive oldest turns
 		int toArchiveCount = turns.size() - this.maxTurns;
 		List<List<SessionEvent>> archivedTurns = turns.subList(0, toArchiveCount);
-		List<List<SessionEvent>> keptTurns = turns.subList(toArchiveCount, turns.size());
-
 		List<SessionEvent> archived = archivedTurns.stream().flatMap(List::stream).toList();
-		List<SessionEvent> kept = keptTurns.stream().flatMap(List::stream).toList();
 
-		// 6. Assemble result: [synthetics] + [preamble] + [kept turns]
-		List<SessionEvent> compacted = new ArrayList<>(synthetic);
-		compacted.addAll(preamble);
-		compacted.addAll(kept);
-
-		int tokensArchived = archived.stream()
-			.mapToInt(e -> this.tokenCountEstimator.estimate(CompactionUtils.formatEvent(e)))
-			.sum();
-
-		return new CompactionResult(compacted, archived, tokensArchived);
+		// 6. Everything else (system message, synthetics, preamble, kept turns) stays in
+		// the active window, in its original log order
+		return CompactionUtils.archiving(events, archived, supersededSystem, tokens);
 	}
 
 	/**
-	 * Groups a flat list of events into turns. Each turn starts with a root-level
-	 * ({@code branch == null}) {@link MessageType#USER} event. Sub-agent branch events are
-	 * grouped with the enclosing root turn. Assumes {@code events} begins with a root user
-	 * message (preamble has already been stripped).
+	 * Groups a flat list of events into turns. Each turn starts with a
+	 * {@link MessageType#USER} event. Assumes {@code events} begins with a user message
+	 * (preamble has already been stripped).
 	 */
 	private static List<List<SessionEvent>> groupIntoTurns(List<SessionEvent> events) {
 		List<List<SessionEvent>> turns = new ArrayList<>();
 		List<SessionEvent> currentTurn = null;
 
 		for (SessionEvent event : events) {
-			if (event.isRootEvent() && event.getMessageType() == MessageType.USER) {
+			if (CompactionUtils.isTurnStart(event)) {
 				if (currentTurn != null) {
 					turns.add(currentTurn);
 				}

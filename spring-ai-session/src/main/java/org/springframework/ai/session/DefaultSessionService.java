@@ -24,6 +24,7 @@ import java.util.UUID;
 
 import org.jspecify.annotations.Nullable;
 
+import org.springframework.ai.chat.messages.MessageType;
 import org.springframework.ai.session.compaction.CompactionRequest;
 import org.springframework.ai.session.compaction.CompactionResult;
 import org.springframework.ai.session.compaction.CompactionStrategy;
@@ -42,11 +43,15 @@ public class DefaultSessionService implements SessionService {
 
 	private final SessionRepository sessionRepository;
 
-	private DefaultSessionService(SessionRepository sessionRepository, Duration defaultTimeToLive) {
+	private final boolean allowSystemMessages;
+
+	private DefaultSessionService(SessionRepository sessionRepository, Duration defaultTimeToLive,
+			boolean allowSystemMessages) {
 		Assert.notNull(sessionRepository, "sessionRepository must not be null");
 		Assert.notNull(defaultTimeToLive, "defaultTimeToLive must not be null");
 		this.sessionRepository = sessionRepository;
 		this.defaultTimeToLive = defaultTimeToLive;
+		this.allowSystemMessages = allowSystemMessages;
 	}
 
 	@Override
@@ -68,7 +73,13 @@ public class DefaultSessionService implements SessionService {
 			.metadata(new HashMap<>(request.metadata()))
 			.build();
 
-		return this.sessionRepository.save(session);
+		// Insert-only and atomic: never silently overwrite an existing session (an upsert
+		// would reassign its owner and TTL while keeping its event log), even when two
+		// callers create the same id concurrently.
+		if (!this.sessionRepository.saveIfAbsent(session)) {
+			throw new IllegalStateException("Session already exists: " + sessionId);
+		}
+		return session;
 	}
 
 	@Override
@@ -93,14 +104,20 @@ public class DefaultSessionService implements SessionService {
 	@Override
 	public int deleteExpiredSessions(Instant before) {
 		Assert.notNull(before, "before must not be null");
-		List<String> expired = this.sessionRepository.findExpiredSessionIds(before);
-		expired.forEach(this.sessionRepository::delete);
-		return expired.size();
+		return this.sessionRepository.deleteExpiredSessions(before);
 	}
 
 	@Override
 	public void appendEvent(SessionEvent event) {
 		Assert.notNull(event, "event must not be null");
+		if (!this.allowSystemMessages && event.getMessageType() == MessageType.SYSTEM) {
+			throw new IllegalArgumentException("Storing a SystemMessage in session '" + event.getSessionId()
+					+ "' is disabled. System prompts are configuration: supply them on every request "
+					+ "(e.g. ChatClient defaultSystem/.system, or your own prompt builder) and keep per-session "
+					+ "settings in Session.metadata. To store system messages anyway, use "
+					+ "DefaultSessionService.builder().allowSystemMessages(true) or set "
+					+ "spring.ai.session.allow-system-messages=true. See the \"System Messages\" reference page.");
+		}
 		this.sessionRepository.appendEvent(event);
 	}
 
@@ -165,9 +182,26 @@ public class DefaultSessionService implements SessionService {
 
 		private Duration defaultTimeToLive = Duration.ofDays(60);
 
+		private boolean allowSystemMessages = false;
+
 		public Builder sessionRepository(SessionRepository sessionRepository) {
 			Assert.notNull(sessionRepository, "sessionRepository must not be null");
 			this.sessionRepository = sessionRepository;
+			return this;
+		}
+
+		/**
+		 * Whether {@link #appendEvent(SessionEvent)} may store a
+		 * {@link org.springframework.ai.chat.messages.SystemMessage}. Defaults to
+		 * {@code false}: system prompts are configuration, best supplied on every request
+		 * rather than stored in the session, so storing one is rejected with an
+		 * {@link IllegalArgumentException} that explains how to enable it. Set to
+		 * {@code true} to store system messages anyway. The latest stored system message is
+		 * then the system prompt; see
+		 * {@link org.springframework.ai.session.compaction.CompactionStrategy} implementations.
+		 */
+		public Builder allowSystemMessages(boolean allowSystemMessages) {
+			this.allowSystemMessages = allowSystemMessages;
 			return this;
 		}
 
@@ -178,7 +212,8 @@ public class DefaultSessionService implements SessionService {
 		}
 
 		public DefaultSessionService build() {
-			return new DefaultSessionService(this.sessionRepository, this.defaultTimeToLive);
+			return new DefaultSessionService(this.sessionRepository, this.defaultTimeToLive,
+					this.allowSystemMessages);
 		}
 
 	}

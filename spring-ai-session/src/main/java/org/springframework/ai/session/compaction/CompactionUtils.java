@@ -16,7 +16,10 @@
 
 package org.springframework.ai.session.compaction;
 
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.function.ToIntFunction;
 import java.util.stream.Collectors;
 
 import org.springframework.ai.chat.messages.AssistantMessage;
@@ -82,8 +85,111 @@ final class CompactionUtils {
 	}
 
 	/**
-	 * Advances {@code rawCutIndex} forward until it points to a root-level (null-branch)
-	 * {@link MessageType#USER} event, or to {@code real.size()} if no such event exists.
+	 * Returns {@code true} for a system message stored by the application: a
+	 * non-synthetic {@link MessageType#SYSTEM} event. Synthetic events (e.g. legacy
+	 * {@code SYSTEM} summaries) keep their own handling.
+	 */
+	static boolean isStoredSystemEvent(SessionEvent event) {
+		return !event.isSynthetic() && event.getMessageType() == MessageType.SYSTEM;
+	}
+
+	/**
+	 * Returns the stored system message that compaction keeps: the <em>latest</em>
+	 * {@linkplain #isStoredSystemEvent stored system event}, as a list of at most one
+	 * event.
+	 *
+	 * <p>
+	 * The latest stored system message is the agent's system prompt ("latest wins"):
+	 * storing a new one replaces the previous one, and it is the integrator's
+	 * responsibility to put the complete intended content in it. Every strategy keeps this
+	 * event in the active window, where it was stored, and never summarizes it (readers
+	 * such as {@code SessionMemoryAdvisor} put it first in the prompt). Earlier stored
+	 * system messages are {@linkplain #supersededSystemEvents superseded} and archived, so
+	 * storing one per turn cannot grow the active window.
+	 * @param events the session events, oldest first
+	 * @return the latest stored system event, or an empty list if there is none
+	 */
+	static List<SessionEvent> pinnedSystemEvents(List<SessionEvent> events) {
+		for (int i = events.size() - 1; i >= 0; i--) {
+			if (isStoredSystemEvent(events.get(i))) {
+				return List.of(events.get(i));
+			}
+		}
+		return List.of();
+	}
+
+	/**
+	 * Returns the stored system events superseded by a later one: every
+	 * {@linkplain #isStoredSystemEvent stored system event} other than the
+	 * {@code pinned} one, in order. Strategies archive them (they remain searchable
+	 * through Recall Storage) and never summarize them.
+	 */
+	static List<SessionEvent> supersededSystemEvents(List<SessionEvent> events, List<SessionEvent> pinned) {
+		return events.stream().filter(e -> isStoredSystemEvent(e) && !pinned.contains(e)).toList();
+	}
+
+	/**
+	 * Returns the real conversation events subject to the strategy's budget: every event
+	 * that is neither synthetic nor a {@linkplain #isStoredSystemEvent stored system
+	 * event}, in order.
+	 */
+	static List<SessionEvent> compactableEvents(List<SessionEvent> events) {
+		return events.stream().filter(e -> !e.isSynthetic() && !isStoredSystemEvent(e)).toList();
+	}
+
+	/**
+	 * Returns the events whose tokens count toward a token budget: the events actually
+	 * sent to the model. That is the latest stored system message, the synthetic summary
+	 * events and the real conversation; superseded system messages are not sent, so they
+	 * are not counted. {@link TokenCountCompactionStrategy} and {@link TokenCountTrigger}
+	 * both use this, so the trigger's threshold and the strategy's budget measure the same
+	 * thing.
+	 */
+	static List<SessionEvent> budgetedEvents(List<SessionEvent> events) {
+		List<SessionEvent> pinned = pinnedSystemEvents(events);
+		return events.stream().filter(e -> !isStoredSystemEvent(e) || pinned.contains(e)).toList();
+	}
+
+	/**
+	 * Result for a pass where the strategy's budget needs no cut. The events are returned
+	 * unchanged when there are no superseded system events; otherwise only the superseded
+	 * ones are archived, so "latest wins" is applied whenever compaction runs.
+	 */
+	static CompactionResult unchangedExceptSuperseded(List<SessionEvent> events, List<SessionEvent> superseded,
+			ToIntFunction<SessionEvent> tokens) {
+		if (superseded.isEmpty()) {
+			return new CompactionResult(events, List.of(), 0);
+		}
+		return archiving(events, List.of(), superseded, tokens);
+	}
+
+	/**
+	 * Result for a pass that cut real events: archives the removed real events together
+	 * with the superseded system events. Compaction never reorders events: both the
+	 * archived events and the new active window (every other event) keep their original
+	 * log order, so a kept system message stays where it was stored.
+	 */
+	static CompactionResult archiving(List<SessionEvent> events, List<SessionEvent> removedReal,
+			List<SessionEvent> superseded, ToIntFunction<SessionEvent> tokens) {
+		Set<SessionEvent> toArchive = new HashSet<>(removedReal);
+		toArchive.addAll(superseded);
+		List<SessionEvent> archived = events.stream().filter(toArchive::contains).toList();
+		List<SessionEvent> compacted = events.stream().filter(e -> !toArchive.contains(e)).toList();
+		return new CompactionResult(compacted, archived, archived.stream().mapToInt(tokens).sum());
+	}
+
+	/**
+	 * Returns {@code true} if the event starts a turn: a {@link MessageType#USER} event.
+	 * Synthetic events are excluded from the real-event list before this is applied.
+	 */
+	static boolean isTurnStart(SessionEvent event) {
+		return event.getMessageType() == MessageType.USER;
+	}
+
+	/**
+	 * Advances {@code rawCutIndex} forward until it points to a
+	 * {@linkplain #isTurnStart turn start}, or to {@code real.size()} if no such event
+	 * exists.
 	 *
 	 * <p>
 	 * Compaction strategies compute a raw cut point (the index into the real-event list
@@ -93,16 +199,42 @@ final class CompactionUtils {
 	 * kept window always begins at a complete turn, preserving conversation semantics.
 	 * @param real the list of non-synthetic session events
 	 * @param rawCutIndex the initial cut point; must be in {@code [0, real.size()]}
-	 * @return the adjusted index pointing to the first root-level USER event at or after
+	 * @return the adjusted index pointing to the first USER event at or after
 	 * {@code rawCutIndex}, or {@code real.size()} if none exists
 	 */
 	static int snapToTurnStart(List<SessionEvent> real, int rawCutIndex) {
 		int idx = rawCutIndex;
-		while (idx < real.size()
-				&& !(real.get(idx).isRootEvent() && real.get(idx).getMessageType() == MessageType.USER)) {
+		while (idx < real.size() && !isTurnStart(real.get(idx))) {
 			idx++;
 		}
 		return idx;
+	}
+
+	/**
+	 * Guards against a cut that would archive the entire real-event window. When
+	 * {@code cutIndex == real.size()} — e.g. because the most recent turn alone exceeds
+	 * the strategy's budget, so {@link #snapToTurnStart} found no later turn start — the
+	 * cut is moved back to the last {@linkplain #isTurnStart turn start} so that the
+	 * current turn is always kept in the active window, even if it exceeds the budget.
+	 * When there is no {@code USER} event at all (no turn boundary to cut at), returns
+	 * {@code 0}, so nothing is archived. Returns {@code cutIndex} unchanged when it
+	 * already keeps at least one event.
+	 * @param real the list of non-synthetic session events
+	 * @param cutIndex the snapped cut point; must be in {@code [0, real.size()]}
+	 * @return an index that keeps at least the last complete turn, or {@code 0} when
+	 * there is no turn
+	 */
+	static int retainLastTurn(List<SessionEvent> real, int cutIndex) {
+		if (cutIndex < real.size()) {
+			return cutIndex;
+		}
+		for (int i = real.size() - 1; i >= 0; i--) {
+			if (isTurnStart(real.get(i))) {
+				return i;
+			}
+		}
+		// No turn boundary to cut at: archive nothing rather than the whole window
+		return 0;
 	}
 
 }

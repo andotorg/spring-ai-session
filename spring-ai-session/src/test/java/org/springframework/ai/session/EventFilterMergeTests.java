@@ -17,11 +17,14 @@
 package org.springframework.ai.session;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 import org.junit.jupiter.api.Test;
 
 import org.springframework.ai.chat.messages.MessageType;
+import org.springframework.ai.session.EventFilter.MatchMode;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -41,13 +44,6 @@ class EventFilterMergeTests {
 		EventFilter base = EventFilter.lastN(10);
 		EventFilter other = EventFilter.lastN(3);
 		assertThat(base.merge(other).lastN()).isEqualTo(3);
-	}
-
-	@Test
-	void otherBranchOverridesBase() {
-		EventFilter base = EventFilter.forBranch("orch");
-		EventFilter other = EventFilter.forBranch("orch.researcher");
-		assertThat(base.merge(other).branch()).isEqualTo("orch.researcher");
 	}
 
 	@Test
@@ -83,6 +79,23 @@ class EventFilterMergeTests {
 	}
 
 	@Test
+	void otherKeywordsAndMatchModeOverrideBase() {
+		EventFilter base = EventFilter.keywordsSearch(List.of("spring"), MatchMode.ANY);
+		EventFilter other = EventFilter.keywordsSearch(List.of("actually", "instead"), MatchMode.ALL);
+		EventFilter merged = base.merge(other);
+		assertThat(merged.keywords()).containsExactly("actually", "instead");
+		assertThat(merged.matchMode()).isEqualTo(MatchMode.ALL);
+	}
+
+	@Test
+	void otherPatternOverridesBase() {
+		EventFilter base = EventFilter.patternSearch(Pattern.compile("we decided"));
+		EventFilter other = EventFilter.patternSearch(Pattern.compile("let's go with"));
+		EventFilter merged = base.merge(other);
+		assertThat(merged.pattern().pattern()).isEqualTo("let's go with");
+	}
+
+	@Test
 	void otherPageAndPageSizeOverrideBase() {
 		EventFilter base = EventFilter.builder().page(0).pageSize(10).build();
 		EventFilter other = EventFilter.builder().page(2).pageSize(5).build();
@@ -94,17 +107,39 @@ class EventFilterMergeTests {
 	// --- base fields are kept when other has no value ---
 
 	@Test
+	void otherPaginationReplacesBaseLastN() {
+		EventFilter base = EventFilter.lastN(20);
+		EventFilter other = EventFilter.keywordSearch("spring", 1, 5);
+		EventFilter merged = base.merge(other);
+		assertThat(merged.lastN()).isNull();
+		assertThat(merged.page()).isEqualTo(1);
+		assertThat(merged.pageSize()).isEqualTo(5);
+		assertThat(merged.keyword()).isEqualTo("spring");
+	}
+
+	@Test
+	void otherLastNReplacesBasePagination() {
+		EventFilter base = EventFilter.builder().page(3).pageSize(10).build();
+		EventFilter merged = base.merge(EventFilter.lastN(4));
+		assertThat(merged.lastN()).isEqualTo(4);
+		assertThat(merged.page()).isNull();
+		assertThat(merged.pageSize()).isNull();
+	}
+
+	@Test
+	void basePaginationKeptWhenOtherHasNoRetrievalModifier() {
+		EventFilter base = EventFilter.builder().page(3).pageSize(10).build();
+		EventFilter merged = base.merge(EventFilter.builder().keyword("orch").build());
+		assertThat(merged.page()).isEqualTo(3);
+		assertThat(merged.pageSize()).isEqualTo(10);
+		assertThat(merged.keyword()).isEqualTo("orch");
+	}
+
+	@Test
 	void baseLastNKeptWhenOtherIsAll() {
 		EventFilter base = EventFilter.lastN(5);
 		EventFilter other = EventFilter.all();
 		assertThat(base.merge(other).lastN()).isEqualTo(5);
-	}
-
-	@Test
-	void baseBranchKeptWhenOtherHasNoBranch() {
-		EventFilter base = EventFilter.forBranch("orch.writer");
-		EventFilter other = EventFilter.all();
-		assertThat(base.merge(other).branch()).isEqualTo("orch.writer");
 	}
 
 	// --- excludeSynthetic is OR-ed ---

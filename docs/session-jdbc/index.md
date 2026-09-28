@@ -10,24 +10,23 @@ and H2 out of the box.
 
 ```
 AI_SESSION          — session metadata (id, user_id, TTL, metadata JSON, event_version)
-AI_SESSION_EVENT    — append-only event log (FK → AI_SESSION, ON DELETE CASCADE)
+AI_SESSION_EVENT    — event log (FK → AI_SESSION, ON DELETE CASCADE)
 ```
 
 `AI_SESSION_EVENT` rows are ordered by a monotonic `seq` column (insertion order) and carry
 `synthetic` and `archived` flags. Compaction archives events in place rather than deleting
-them, so the full history stays searchable. The `event_version` column on `AI_SESSION` is
-incremented on every `appendEvent` and `compactEvents` call, enabling optimistic-lock
-compaction.
+them, so the full history stays searchable.
 
 ---
 
 ## Dependency
 
+With the [BOM](../getting-started.md#add-the-bom-recommended) imported, no version is needed:
+
 ```xml
 <dependency>
     <groupId>org.springaicommunity</groupId>
     <artifactId>spring-ai-session-jdbc</artifactId>
-    <version>${spring-ai-session.version}</version>
 </dependency>
 ```
 
@@ -35,15 +34,22 @@ compaction.
 
 ## Schema
 
-DDL scripts are bundled on the classpath. Run the one matching your database:
+DDL scripts are bundled on the classpath. Each supported database has a dialect (auto-detected
+from the database metadata) and a schema script:
 
-| Database | Script |
-|---|---|
-| PostgreSQL | `org/springframework/ai/session/jdbc/schema-postgresql.sql` |
-| H2 | `org/springframework/ai/session/jdbc/schema-h2.sql` |
-| MySQL / MariaDB | `org/springframework/ai/session/jdbc/schema-mysql.sql` |
+| Database | Dialect class | Script |
+|---|---|---|
+| PostgreSQL | `PostgresJdbcSessionRepositoryDialect` | `org/springframework/ai/session/jdbc/schema-postgresql.sql` |
+| MySQL / MariaDB | `MysqlJdbcSessionRepositoryDialect` | `org/springframework/ai/session/jdbc/schema-mysql.sql` |
+| H2 | `H2JdbcSessionRepositoryDialect` | `org/springframework/ai/session/jdbc/schema-h2.sql` |
 
-Apply the schema with Spring Boot's SQL initialisation:
+Other databases are rejected at startup with an `IllegalStateException`. To use one,
+implement `JdbcSessionRepositoryDialect` and pass it via
+`JdbcSessionRepository.builder().dialect(...)`, or open an issue or contribute a dialect.
+
+With the auto-configuration, set
+[`initialize-schema`](auto-configuration.md#schema-initialisation) to apply the script on
+startup. Otherwise use Spring Boot's SQL initialisation:
 
 ```yaml
 spring:
@@ -52,8 +58,7 @@ spring:
       schema-locations: classpath:org/springframework/ai/session/jdbc/schema-postgresql.sql
 ```
 
-Or use your existing migration tool (Flyway, Liquibase) by copying the appropriate script
-into your migration directory.
+Or copy the script into your migration tool (Flyway, Liquibase).
 
 ---
 
@@ -63,13 +68,13 @@ into your migration directory.
 @Bean
 SessionRepository sessionRepository(DataSource dataSource) {
     return JdbcSessionRepository.builder()
-        .dataSource(dataSource)   // SQL dialect is auto-detected from the DataSource URL
+        .dataSource(dataSource)   // SQL dialect is auto-detected from the database metadata
         .build();
 }
 
 @Bean
 SessionService sessionService(SessionRepository sessionRepository) {
-    return new DefaultSessionService(sessionRepository);
+    return DefaultSessionService.builder().sessionRepository(sessionRepository).build();
 }
 ```
 
@@ -111,19 +116,6 @@ List<SessionEvent> events = sessions.findEvents(session.id(), EventFilter.builde
 
 ---
 
-## Supported databases
-
-| Database | Dialect class |
-|---|---|
-| PostgreSQL | `PostgresJdbcSessionRepositoryDialect` |
-| H2 | `H2JdbcSessionRepositoryDialect` |
-| MySQL / MariaDB | `MysqlJdbcSessionRepositoryDialect` |
-
-Other databases default to the PostgreSQL dialect. Open an issue or contribute a dialect
-implementation for additional databases.
-
----
-
 ## Design notes
 
 **Message serialisation** — each `SessionEvent`'s wrapped `Message` is stored in three
@@ -132,13 +124,26 @@ columns: `message_type` (enum name), `message_content` (plain text), and `messag
 message types.
 
 **Optimistic concurrency** — the `event_version` column on `AI_SESSION` is incremented on
-every `appendEvent` and `compactEvents` call. `compactEvents` atomically claims the version
-slot with `UPDATE … WHERE event_version = ?` before modifying the event log, making
-compaction safe under concurrent access.
+every `appendEvent` and `compactEvents` call. `compactEvents` claims the version slot with
+`UPDATE … WHERE event_version = ?` before modifying the event log, so concurrent
+compactions cannot both succeed.
 
 **`synthetic` column** — stored as a dedicated `BOOLEAN` column (not only in the metadata
 JSON blob) so `EventFilter.excludeSynthetic()` translates to a SQL predicate instead of
 an in-process scan.
+
+**`EventFilter.keyword()`/`keywords()`** translate to `LOWER(...) LIKE ? ESCAPE '!'`
+predicates — one for `keyword`, one per term for `keywords`, joined with `AND`/`OR` per
+`matchMode`. Terms are always bound as JDBC parameters, and `%`, `_` and `!` are escaped so
+they match literally, as in the in-memory repository.
+
+**`EventFilter.pattern()` falls back to in-memory filtering.** Java regex cannot be
+translated to portable SQL — each database has its own regex dialect, none a superset of
+Java's (backreferences, lookaround, named groups). When `pattern` is set, every other
+criterion is still pushed down to SQL, but pagination (`lastN`/`page`/`pageSize`) is
+deferred: the SQL-filtered rows are fetched, re-checked with `EventFilter.matches()` in
+Java, and paginated afterward, as `InMemorySessionRepository` does. Expect a `pattern`
+query to scan more history than an equivalent `keyword`/`keywords` query.
 
 ---
 

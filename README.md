@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Java Version](https://img.shields.io/badge/Java-17%2B-orange)](https://www.oracle.com/java/technologies/javase/jdk17-archive-downloads.html)
-[![Spring AI Session](https://img.shields.io/maven-central/v/org.springaicommunity/spring-ai-session?label=Maven%20Central)](https://central.sonatype.com/artifact/org.springaicommunity/spring-ai-session)
+[![Spring AI Session](https://img.shields.io/maven-central/v/org.springaicommunity/spring-ai-session-bom?label=Maven%20Central)](https://central.sonatype.com/artifact/org.springaicommunity/spring-ai-session-bom)
 
 A [Spring AI](https://docs.spring.io/spring-ai/reference/) library that provides structured, event-sourced session management with context compaction for AI applications.
 
@@ -12,24 +12,9 @@ Most AI frameworks store conversation history as a flat list of messages. That w
 
 **Spring AI Session** solves this with:
 
-- **Structured events** — every message is a `SessionEvent` with identity, timestamp, session ownership, and an optional branch label for multi-agent hierarchies
+- **Structured events** — every message is a `SessionEvent` with identity, timestamp, session ownership, and metadata
 - **Turn-aware compaction** — configurable triggers fire when history grows too large; pluggable strategies decide what to keep, always respecting turn boundaries
 - **Persistent repositories** — a clean SPI (`SessionRepository`) makes it trivial to swap the in-memory store for JDBC, Redis, or any other backend
-
-## Project Structure
-
-```
-spring-ai-session/
-├── spring-ai-session-bom/                               # Bill of Materials for version 
-├── spring-ai-session/                                   # Core SPI, compaction framework, SessionMemoryAdvisor
-├── spring-ai-session-jdbc/                              # JDBC-backed SessionRepository (PostgreSQL, MySQL, H2) management
-└── auto-configurations/
-    └── session/
-        ├── spring-ai-autoconfigure-session/             # Spring Boot auto-configuration for DefaultSessionService
-        └── spring-ai-autoconfigure-session-jdbc/        # Spring Boot auto-configuration for the JDBC repository
-└── boot-starters/
-    └── spring-ai-starter-session-jdbc/                  # Spring Boot starter (JDBC session, one-dependency setup)
-```
 
 ## Modules
 
@@ -39,7 +24,7 @@ spring-ai-session/
 | **Session JDBC** | `spring-ai-session-jdbc` | JDBC-backed `SessionRepository` for PostgreSQL, MySQL, MariaDB, and H2 |
 | **Session Auto-configuration** | `spring-ai-autoconfigure-session` | Spring Boot auto-configuration for `DefaultSessionService` (repository-agnostic) |
 | **Session JDBC Auto-configuration** | `spring-ai-autoconfigure-session-jdbc` | Spring Boot auto-configuration for the JDBC repository |
-| **Session JDBC Starter** | `spring-ai-starter-session-jdbc` | Spring Boot starter — pulls in JDBC repository, auto-configurations, and `spring-boot-starter` |
+| **Session JDBC Starter** | `spring-ai-starter-session-jdbc` | Spring Boot starter — pulls in the JDBC repository, auto-configurations, and `spring-boot-starter-jdbc` |
 | **Session BOM** | `spring-ai-session-bom` | Bill of Materials for managing all module versions together |
 
 ## Quick Start
@@ -52,7 +37,7 @@ spring-ai-session/
         <dependency>
             <groupId>org.springaicommunity</groupId>
             <artifactId>spring-ai-session-bom</artifactId>
-            <version>0.5.0-SNAPSHOT</version>
+            <version>0.9.0</version>
             <type>pom</type>
             <scope>import</scope>
         </dependency>
@@ -101,54 +86,30 @@ String answer = client.prompt()
 
 ## Documentation
 
-Full reference documentation is available at:
+Full reference documentation: **[spring-ai-community.github.io/spring-ai-session](https://spring-ai-community.github.io/spring-ai-session/)**. Good places to start:
 
-**[https://spring-ai-community.github.io/spring-ai-session/](https://spring-ai-community.github.io/spring-ai-session/)**
-
-Topics covered:
-
-- [Getting Started](https://spring-ai-community.github.io/spring-ai-session/latest-snapshot/getting-started/) — setup options (in-memory, JDBC auto-config, JDBC manual)
-- [Session Concepts](https://spring-ai-community.github.io/spring-ai-session/latest-snapshot/session-management/concepts/) — `Session`, `SessionEvent`, turns, and architecture
-- [Event Filtering](https://spring-ai-community.github.io/spring-ai-session/latest-snapshot/session-management/event-filtering/) — composable `EventFilter` API
-- [Context Compaction](https://spring-ai-community.github.io/spring-ai-session/latest-snapshot/session-management/compaction/) — triggers, strategies, turn-boundary safety
-- [ChatClient Integration](https://spring-ai-community.github.io/spring-ai-session/latest-snapshot/session-management/chat-client/) — `SessionMemoryAdvisor` setup and options
-- [Multi-Agent Branch Isolation](https://spring-ai-community.github.io/spring-ai-session/latest-snapshot/session-management/multi-agent/) — sharing sessions across parallel agents
-- [Recall Storage](https://spring-ai-community.github.io/spring-ai-session/latest-snapshot/session-management/recall-storage/) — keyword search over the full verbatim history
-- [Session JDBC](https://spring-ai-community.github.io/spring-ai-session/latest-snapshot/session-jdbc/) — JDBC repository setup, schema, and design notes
+- [Getting Started](https://spring-ai-community.github.io/spring-ai-session/latest/getting-started/) — setup options (Spring Boot starter, JDBC manual, in-memory)
+- [Session Concepts](https://spring-ai-community.github.io/spring-ai-session/latest/session-management/concepts/) — `Session`, `SessionEvent`, turns, and architecture
+- [Context Compaction](https://spring-ai-community.github.io/spring-ai-session/latest/session-management/compaction/) — triggers, strategies, turn-boundary safety
+- [ChatClient Integration](https://spring-ai-community.github.io/spring-ai-session/latest/chat-client/chat-client/) — `SessionMemoryAdvisor` setup and options
+- [Migration Guide](https://spring-ai-community.github.io/spring-ai-session/latest/migration/) — upgrade notes and breaking changes
 
 ## Requirements
 
 - Java 17+
-- Spring AI `2.0.0+`
-- Spring Boot `4.0.7+`
+- Spring AI `2.0.1+`
+- Spring Boot `4.1.1+`
 - Maven 3.6+
 
 ## Building
 
 ```bash
-./mvnw clean install
+./mvnw clean install              # add -DskipTests to skip tests
 ```
 
-To skip tests:
-
-```bash
-./mvnw clean install -DskipTests
-```
-
-## Snapshot Repository
-
-Snapshot artifacts are published to the Spring snapshot repository:
-
-```xml
-<repositories>
-    <repository>
-        <id>spring-snapshots</id>
-        <url>https://repo.spring.io/snapshot</url>
-        <snapshots><enabled>true</enabled></snapshots>
-        <releases><enabled>false</enabled></releases>
-    </repository>
-</repositories>
-```
+Snapshot artifacts are published to the Central Portal snapshot repository; see
+[Maven Repositories](https://spring-ai-community.github.io/spring-ai-session/latest-snapshot/getting-started/#maven-repositories)
+for the `<repositories>` entry.
 
 ## License
 
@@ -156,7 +117,6 @@ Apache License 2.0
 
 ## Links
 
-- [Documentation](https://spring-ai-community.github.io/spring-ai-session/)
 - [Issue Tracker](https://github.com/spring-ai-community/spring-ai-session/issues)
 - [Spring AI Documentation](https://docs.spring.io/spring-ai/reference/)
 - [Spring AI Community](https://github.com/spring-ai-community)

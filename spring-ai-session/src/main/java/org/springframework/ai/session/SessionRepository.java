@@ -37,10 +37,32 @@ public interface SessionRepository {
 
 	/**
 	 * Persists session metadata (create or update). If the session already exists its
-	 * event log is preserved.
+	 * event log and its original {@link Session#createdAt()} are preserved; the other
+	 * metadata fields are replaced.
 	 * @return the saved session
 	 */
 	Session save(Session session);
+
+	/**
+	 * Inserts the session only if no session with the same id exists — never updates an
+	 * existing one. Used by {@link SessionService#create(CreateSessionRequest)} so that
+	 * two concurrent creates of the same id cannot both succeed (the second would
+	 * otherwise silently take over the first caller's session).
+	 * <p>
+	 * Implementations should perform the check and the insert atomically (e.g. a
+	 * primary-key-guarded {@code INSERT}). The default implementation is a non-atomic
+	 * {@link #findById} followed by {@link #save}, kept only for compatibility with
+	 * existing custom repositories; override it.
+	 * @return {@code true} if the session was inserted, {@code false} if a session with
+	 * the same id already exists (the existing session is left untouched)
+	 */
+	default boolean saveIfAbsent(Session session) {
+		if (findById(session.id()) != null) {
+			return false;
+		}
+		save(session);
+		return true;
+	}
 
 	@Nullable Session findById(String sessionId);
 
@@ -56,13 +78,43 @@ public interface SessionRepository {
 	 */
 	void delete(String sessionId);
 
+	/**
+	 * Deletes every session whose TTL has expired before the given instant, together with
+	 * its events, and returns the number of sessions deleted.
+	 * <p>
+	 * Implementations should check the expiry and delete in one atomic step, so that a
+	 * session whose TTL was extended concurrently (e.g. by {@link #save(Session)}) is not
+	 * deleted. The default implementation is not atomic: it deletes the sessions returned
+	 * by {@link #findExpiredSessionIds(Instant)} one by one.
+	 * @param before the expiry cut-off
+	 * @return the number of sessions deleted
+	 */
+	default int deleteExpiredSessions(Instant before) {
+		List<String> expired = findExpiredSessionIds(before);
+		expired.forEach(this::delete);
+		return expired.size();
+	}
+
 	// Events
 
 	/**
 	 * Appends a single event to the session's event log. The target session is identified
-	 * by {@link SessionEvent#getSessionId()}. Also updates {@code lastActiveAt} on the
-	 * session.
+	 * by {@link SessionEvent#getSessionId()}.
+	 * <p>
+	 * <strong>Idempotent by id:</strong> if an event with the same
+	 * {@link SessionEvent#getId()} already exists for this session, this call is a no-op
+	 * — it does not throw, and it does not append a duplicate row or increment the
+	 * event-log version. This makes a retried append (e.g. after a crash between the
+	 * write and the caller receiving confirmation) safe to repeat. Callers that want this
+	 * safety should supply a deterministic id (e.g. derived from a durable run/turn id)
+	 * rather than relying on {@link SessionEvent.Builder}'s random default.
+	 * <p>
+	 * Event ids should be unique across <em>all</em> sessions: persistent implementations
+	 * (e.g. JDBC) key events by id alone and reject an id already used by a different
+	 * session rather than silently dropping the event.
 	 * @throws IllegalArgumentException if the session does not exist
+	 * @throws IllegalStateException if the id is already used by an event of another
+	 * session (implementations with a global event-id namespace only)
 	 */
 	void appendEvent(SessionEvent event);
 
@@ -76,15 +128,20 @@ public interface SessionRepository {
 	 * <p>
 	 * Archived events are <em>retained</em> in the log (soft-deleted via
 	 * {@link SessionEvent#isArchived()}) so they remain searchable by the Recall Storage
-	 * tools. On success the resulting active log is, in order:
-	 * <ol>
-	 * <li>all events that were already archived (preserved as-is),</li>
-	 * <li>the events in {@code archivedEvents}, now marked archived,</li>
-	 * <li>the events in {@code retainedEvents} (the new active window, typically a
-	 * synthetic summary turn followed by the most recent events), marked active.</li>
-	 * </ol>
-	 * Any previously-active event that appears in neither list (e.g. a superseded
-	 * synthetic summary) is removed.
+	 * tools. Compaction never reorders existing events. On success:
+	 * <ul>
+	 * <li>the events in {@code archivedEvents} are marked archived <em>in place</em>;</li>
+	 * <li>events that were already archived, and the existing events in
+	 * {@code retainedEvents}, stay where they are;</li>
+	 * <li>any previously-active event that appears in neither list (e.g. a superseded
+	 * synthetic summary) is removed;</li>
+	 * <li>each <em>new</em> event in {@code retainedEvents} (one not yet in the log, such
+	 * as a synthetic summary turn) is inserted immediately before the next existing event
+	 * that follows it in {@code retainedEvents}, or appended at the end of the log when
+	 * none follows.</li>
+	 * </ul>
+	 * The order of the existing events within {@code retainedEvents} is not used, except
+	 * to position the new events.
 	 *
 	 * <p>
 	 * Callers should read {@link #getEventVersion} <em>before</em> reading events via
@@ -92,8 +149,13 @@ public interface SessionRepository {
 	 * {@code false} the caller should treat the compaction as a no-op — the concurrent
 	 * writer already handled the session.
 	 * @param sessionId the session whose log is being compacted
-	 * @param archivedEvents events to mark archived (must already exist in the log)
-	 * @param retainedEvents the new active event set, in chronological order
+	 * @param archivedEvents events to mark archived (must already exist in the log;
+	 * implementations may reject the whole call with {@link IllegalArgumentException}
+	 * otherwise)
+	 * @param retainedEvents the new active window, in log order, including any new events
+	 * at the position they should take (new events must belong to {@code sessionId};
+	 * implementations reject the whole call with {@link IllegalArgumentException}
+	 * otherwise)
 	 * @param expectedVersion the event-log version the caller observed
 	 * @return {@code true} when the swap succeeded, {@code false} on a version mismatch
 	 * @throws IllegalArgumentException if the session does not exist
@@ -103,8 +165,10 @@ public interface SessionRepository {
 
 	/**
 	 * Returns the current event-log version for the given session. The version is
-	 * incremented atomically on every {@link #appendEvent} and {@link #compactEvents}
-	 * call. Returns {@code 0} when the session does not exist or has no events yet.
+	 * incremented atomically on every {@link #appendEvent} call that actually appends a
+	 * new event, and on every {@link #compactEvents} call (an idempotent replay of an
+	 * already-applied {@link #appendEvent} does not increment it). Returns {@code 0} when
+	 * the session does not exist or has no events yet.
 	 * <p>
 	 * Read this <em>before</em> calling {@link #findEvents} to obtain a version that is
 	 * guaranteed to be ≤ the version of the events you subsequently read, which is the

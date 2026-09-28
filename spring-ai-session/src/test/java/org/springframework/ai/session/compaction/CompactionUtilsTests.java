@@ -21,7 +21,7 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 
 import org.springframework.ai.chat.messages.AssistantMessage;
-import org.springframework.ai.chat.messages.ToolResponseMessage;
+import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.session.SessionEvent;
 
@@ -111,51 +111,76 @@ class CompactionUtilsTests {
 		assertThat(CompactionUtils.snapToTurnStart(List.of(), 0)).isEqualTo(0);
 	}
 
-	// --- sub-agent (non-null branch) events are turn-internal, never turn starts ---
+	// --- pinnedSystemEvents / supersededSystemEvents / compactableEvents ---
 
 	@Test
-	void cutOnSubAgentUserSnapsToNextRootUser() {
-		// turn 1: u1, a1; sub-agent turn (branch "sub"): u2, a2; turn 2: u3
-		List<SessionEvent> events = List.of(user("u1"), assistant("a1"), user("u2", "sub"), assistant("a2", "sub"),
-				user("u3"));
+	void latestStoredSystemEventIsPinnedAndEarlierOnesAreSuperseded() {
+		SessionEvent setup = system("Answer in French.");
+		SessionEvent update = system("Answer in German.");
+		List<SessionEvent> events = List.of(setup, user("u1"), assistant("a1"), update, user("u2"));
 
-		// cut at u2 (index 2) — a sub-agent USER, skips the branch and lands on u3 (index 4)
-		assertThat(CompactionUtils.snapToTurnStart(events, 2)).isEqualTo(4);
+		List<SessionEvent> pinned = CompactionUtils.pinnedSystemEvents(events);
+
+		assertThat(pinned).containsExactly(update);
+		assertThat(CompactionUtils.supersededSystemEvents(events, pinned)).containsExactly(setup);
+		assertThat(CompactionUtils.compactableEvents(events)).extracting(e -> e.getMessage().getText())
+			.containsExactly("u1", "a1", "u2");
 	}
 
 	@Test
-	void cutInMiddleOfMultiStepSubAgentTurnSnapsToNextRootUser() {
-		// turn 1: u1, a1; sub-agent turn (branch "sub"): u2, a2 (tool call), t1, a3; turn 2: u3
-		List<SessionEvent> events = List.of(user("u1"), assistant("a1"), user("u2", "sub"), assistantToolCall("sub"),
-				tool("sub"), assistant("a3", "sub"), user("u3"));
+	void noStoredSystemEventMeansNothingPinned() {
+		List<SessionEvent> events = List.of(user("u1"), assistant("a1"));
 
-		// cut at t1 (index 4) — must skip the rest of the branch and land on u3 (index 6)
-		assertThat(CompactionUtils.snapToTurnStart(events, 4)).isEqualTo(6);
-		// cut at u2 (index 2) — same result
-		assertThat(CompactionUtils.snapToTurnStart(events, 2)).isEqualTo(6);
+		assertThat(CompactionUtils.pinnedSystemEvents(events)).isEmpty();
+		assertThat(CompactionUtils.supersededSystemEvents(events, List.of())).isEmpty();
 	}
 
 	@Test
-	void cutOnPeerBranchUsersSnapsPastAllOfThem() {
-		// peer branch 1: u1, a1; peer branch 2: u2, a2; root turn: u3
-		List<SessionEvent> events = List.of(user("u1", "peer1"), assistant("a1", "peer1"), user("u2", "peer2"),
-				assistant("a2", "peer2"), user("u3"));
+	void syntheticSystemEventsAreNotStoredSystemEvents() {
+		SessionEvent syntheticSystem = SessionEvent.builder()
+			.sessionId(SESSION_ID)
+			.message(new SystemMessage("legacy summary"))
+			.metadata(SessionEvent.METADATA_SYNTHETIC, true)
+			.build();
+		SessionEvent rules = system("rules");
 
-		// cut at u1 (index 0) — only null-branch matters, not branch identity; skip both peers, land on u3 (index 4)
-		assertThat(CompactionUtils.snapToTurnStart(events, 0)).isEqualTo(4);
+		assertThat(CompactionUtils.isStoredSystemEvent(syntheticSystem)).isFalse();
+		assertThat(CompactionUtils.isStoredSystemEvent(rules)).isTrue();
+		assertThat(CompactionUtils.pinnedSystemEvents(List.of(rules, user("u1"), syntheticSystem)))
+			.containsExactly(rules);
 	}
 
-	// --- no null-branch USER at or after the cut ---
+	private static SessionEvent system(String text) {
+		return SessionEvent.builder().sessionId(SESSION_ID).message(new SystemMessage(text)).build();
+	}
+
+	// --- retainLastTurn ---
 
 	@Test
-	void onlySubAgentEventsAfterCutReturnsSize() {
-		// sub-agent turn only (branch "sub"): u1, a1 — no root USER to snap to
-		List<SessionEvent> events = List.of(user("u1", "sub"), assistant("a1", "sub"));
+	void retainLastTurnLeavesNonEmptyWindowUnchanged() {
+		List<SessionEvent> events = List.of(user("u1"), assistant("a1"), user("u2"), assistant("a2"));
 
-		assertThat(CompactionUtils.snapToTurnStart(events, 0)).isEqualTo(2);
+		assertThat(CompactionUtils.retainLastTurn(events, 2)).isEqualTo(2);
+		assertThat(CompactionUtils.retainLastTurn(events, 0)).isEqualTo(0);
 	}
 
-	// --- helpers ---
+	@Test
+	void retainLastTurnFallsBackToLastUser() {
+		List<SessionEvent> events = List.of(user("u1"), assistant("a1"), user("u2"), assistant("a2"),
+				assistant("a3"));
+
+		// The newest turn starts at u2 (index 2)
+		assertThat(CompactionUtils.retainLastTurn(events, events.size())).isEqualTo(2);
+	}
+
+	@Test
+	void retainLastTurnWithoutUserArchivesNothing() {
+		List<SessionEvent> events = List.of(assistant("a1"), assistant("a2"));
+
+		// No turn boundary to cut at: keep every event rather than archiving the window
+		assertThat(CompactionUtils.retainLastTurn(events, 2)).isEqualTo(0);
+		assertThat(CompactionUtils.retainLastTurn(List.of(), 0)).isEqualTo(0);
+	}
 
 	private static SessionEvent user(String text) {
 		return SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage(text)).build();
@@ -163,34 +188,6 @@ class CompactionUtilsTests {
 
 	private static SessionEvent assistant(String text) {
 		return SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage(text)).build();
-	}
-
-	private static SessionEvent user(String text, String branch) {
-		return SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage(text)).branch(branch).build();
-	}
-
-	private static SessionEvent assistant(String text, String branch) {
-		return SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage(text)).branch(branch).build();
-	}
-
-	private static SessionEvent assistantToolCall(String branch) {
-		return SessionEvent.builder()
-			.sessionId(SESSION_ID)
-			.message(AssistantMessage.builder()
-				.toolCalls(List.of(new AssistantMessage.ToolCall("call-1", "function", "get_weather", "{}")))
-				.build())
-			.branch(branch)
-			.build();
-	}
-
-	private static SessionEvent tool(String branch) {
-		return SessionEvent.builder()
-			.sessionId(SESSION_ID)
-			.message(ToolResponseMessage.builder()
-				.responses(List.of(new ToolResponseMessage.ToolResponse("call-1", "get_weather", "{\"temp\":\"22C\"}")))
-				.build())
-			.branch(branch)
-			.build();
 	}
 
 }

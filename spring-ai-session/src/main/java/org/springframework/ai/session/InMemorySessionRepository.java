@@ -18,8 +18,11 @@ package org.springframework.ai.session;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
@@ -57,12 +60,27 @@ public final class InMemorySessionRepository implements SessionRepository {
 	@Override
 	public Session save(Session session) {
 		Assert.notNull(session, "session must not be null");
-		this.store.compute(session.id(), (id, existing) -> {
-			List<SessionEvent> events = (existing != null) ? existing.events() : List.of();
-			long version = (existing != null) ? existing.version() : 0L;
-			return new SessionData(session, events, version);
+		SessionData saved = this.store.compute(session.id(), (id, existing) -> {
+			if (existing == null) {
+				return new SessionData(session, List.of(), 0L);
+			}
+			// Update: keep the original creation time, like the JDBC upsert does.
+			Session updated = Session.builder()
+				.id(session.id())
+				.userId(session.userId())
+				.createdAt(existing.session().createdAt())
+				.expiresAt(session.expiresAt())
+				.metadata(session.metadata())
+				.build();
+			return new SessionData(updated, existing.events(), existing.version());
 		});
-		return session;
+		return saved.session();
+	}
+
+	@Override
+	public boolean saveIfAbsent(Session session) {
+		Assert.notNull(session, "session must not be null");
+		return this.store.putIfAbsent(session.id(), new SessionData(session, List.of(), 0L)) == null;
 	}
 
 	@Override
@@ -83,11 +101,33 @@ public final class InMemorySessionRepository implements SessionRepository {
 	}
 
 	@Override
+	public int deleteExpiredSessions(Instant before) {
+		Assert.notNull(before, "before must not be null");
+		int[] deleted = { 0 };
+		for (String sessionId : this.store.keySet()) {
+			// Atomic per session: a concurrent save() that extends the TTL wins
+			this.store.computeIfPresent(sessionId, (id, data) -> {
+				if (isExpired(data, before)) {
+					deleted[0]++;
+					return null;
+				}
+				return data;
+			});
+		}
+		return deleted[0];
+	}
+
+	private static boolean isExpired(SessionData data, Instant before) {
+		Instant expiresAt = data.session().expiresAt();
+		return expiresAt != null && expiresAt.isBefore(before);
+	}
+
+	@Override
 	public List<String> findExpiredSessionIds(Instant before) {
 		Assert.notNull(before, "before must not be null");
 		return this.store.values()
 			.stream()
-			.filter(d -> d.session().expiresAt() != null && d.session().expiresAt().isBefore(before))
+			.filter(d -> isExpired(d, before))
 			.map(d -> d.session().id())
 			.toList();
 	}
@@ -105,6 +145,13 @@ public final class InMemorySessionRepository implements SessionRepository {
 		this.store.compute(sessionId, (id, existing) -> {
 			if (existing == null) {
 				throw new IllegalArgumentException("Session not found: " + sessionId);
+			}
+			boolean alreadyAppended = existing.events().stream().anyMatch(e -> e.getId().equals(event.getId()));
+			if (alreadyAppended) {
+				// Idempotent replay: an event with this id was already committed, e.g. a
+				// retried append after a crash. No-op -- do not duplicate the event or
+				// increment the version.
+				return existing;
 			}
 			List<SessionEvent> newEvents = new ArrayList<>(existing.events());
 			newEvents.add(event);
@@ -127,16 +174,65 @@ public final class InMemorySessionRepository implements SessionRepository {
 				return existing;
 			}
 			success[0] = true;
-			// Preserve previously-archived events (always the oldest prefix), then the
-			// newly-archived events (marked archived), then the new active window. Any other
-			// previously-active event (e.g. a superseded synthetic summary) is dropped.
-			List<SessionEvent> newEvents = new ArrayList<>();
-			existing.events().stream().filter(SessionEvent::isArchived).forEach(newEvents::add);
-			archivedEvents.forEach(e -> newEvents.add(e.asArchived()));
-			newEvents.addAll(retainedEvents);
-			return existing.withEvents(List.copyOf(newEvents));
+			return existing.withEvents(compactedLog(sessionId, existing.events(), archivedEvents, retainedEvents));
 		});
 		return success[0];
+	}
+
+	/**
+	 * Applies a compaction without reordering existing events: {@code archivedEvents}
+	 * are flagged archived in place, previously-active events in neither list are dropped,
+	 * and each new event in {@code retainedEvents} is inserted immediately before the next
+	 * existing event that follows it there (or appended when none follows).
+	 */
+	private static List<SessionEvent> compactedLog(String sessionId, List<SessionEvent> log,
+			List<SessionEvent> archivedEvents, List<SessionEvent> retainedEvents) {
+		Set<String> logIds = log.stream().map(SessionEvent::getId).collect(Collectors.toSet());
+		Set<String> archivedIds = new HashSet<>();
+		for (SessionEvent event : archivedEvents) {
+			if (!logIds.contains(event.getId())) {
+				throw new IllegalArgumentException(
+						"archivedEvents contains an event that is not in the log of session " + sessionId);
+			}
+			archivedIds.add(event.getId());
+		}
+		Set<String> retainedIds = retainedEvents.stream().map(SessionEvent::getId).collect(Collectors.toSet());
+
+		// Group the new events by the existing event they must precede
+		Map<String, List<SessionEvent>> insertBefore = new HashMap<>();
+		List<SessionEvent> pending = new ArrayList<>();
+		for (SessionEvent event : retainedEvents) {
+			if (logIds.contains(event.getId())) {
+				if (!pending.isEmpty()) {
+					insertBefore.computeIfAbsent(event.getId(), id -> new ArrayList<>()).addAll(pending);
+					pending.clear();
+				}
+			}
+			else {
+				if (!sessionId.equals(event.getSessionId())) {
+					throw new IllegalArgumentException("retainedEvents contains a new event of session '"
+							+ event.getSessionId() + "', not of session " + sessionId);
+				}
+				pending.add(event);
+			}
+		}
+
+		List<SessionEvent> result = new ArrayList<>();
+		for (SessionEvent event : log) {
+			result.addAll(insertBefore.getOrDefault(event.getId(), List.of()));
+			if (event.isArchived()) {
+				result.add(event);
+			}
+			else if (archivedIds.contains(event.getId())) {
+				result.add(event.asArchived());
+			}
+			else if (retainedIds.contains(event.getId())) {
+				result.add(event);
+			}
+			// else: a previously-active event in neither list (e.g. a superseded summary)
+		}
+		result.addAll(pending);
+		return List.copyOf(result);
 	}
 
 	@Override
@@ -168,12 +264,13 @@ public final class InMemorySessionRepository implements SessionRepository {
 		if (filter.pageSize() != null) {
 			int pageNum = (filter.page() != null) ? filter.page() : 0;
 			int size = filter.pageSize();
-			int fromIdx = pageNum * size;
+			// long arithmetic: a large page number must not overflow into a negative index
+			long fromIdx = (long) pageNum * size;
 			if (fromIdx >= matched.size()) {
 				matched = new ArrayList<>();
 			}
 			else {
-				matched = matched.subList(fromIdx, Math.min(fromIdx + size, matched.size()));
+				matched = matched.subList((int) fromIdx, (int) Math.min(fromIdx + size, matched.size()));
 			}
 		}
 

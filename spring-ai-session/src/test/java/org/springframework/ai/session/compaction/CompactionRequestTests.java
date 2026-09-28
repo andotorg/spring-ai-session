@@ -93,35 +93,6 @@ class CompactionRequestTests {
 	}
 
 	@Test
-	void branchedUserMessagesAreNotCountedAsTurns() {
-		// Sub-agents write USER messages attributed to their own branch; those must not
-		// inflate the root turn count used by TurnCountTrigger.
-		List<SessionEvent> events = new ArrayList<>();
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("root-q1")).build()); // branch=null
-																												// →
-																												// counts
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("root-a1")).build());
-		events.add(SessionEvent.builder()
-			.sessionId(SESSION_ID)
-			.message(new UserMessage("sub-agent-q"))
-			.branch("orch.researcher")
-			.build()); // branch set → ignored
-		events.add(SessionEvent.builder()
-			.sessionId(SESSION_ID)
-			.message(new AssistantMessage("sub-agent-a"))
-			.branch("orch.researcher")
-			.build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("root-q2")).build()); // branch=null
-																												// →
-																												// counts
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("root-a2")).build());
-
-		CompactionRequest request = requestWith(events);
-
-		assertThat(request.currentTurnCount()).isEqualTo(2);
-	}
-
-	@Test
 	void currentEventCountMatchesEventListSize() {
 		List<SessionEvent> events = new ArrayList<>();
 		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("q1")).build());

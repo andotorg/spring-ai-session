@@ -22,6 +22,7 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.session.Session;
@@ -276,81 +277,63 @@ class TurnWindowCompactionStrategyTests {
 		assertThat(result.tokensEstimatedSaved()).isGreaterThan(0);
 	}
 
-	// --- branch-awareness ---
-
 	@Test
-	void branchUserEventsDoNotInflateTurnCount() {
-		// Root turn 1: [u1, a1, sub-q (branch), sub-a (branch)] — sub-agent exchange inside turn 1
-		// Root turn 2: [u2, a2]
-		// Root turn 3: [u3, a3]
-		// Without branch-awareness the branch USER event would be counted as a 4th turn start,
-		// causing premature archiving.
-		TurnWindowCompactionStrategy strategy = TurnWindowCompactionStrategy.builder().maxTurns(2).build();
-
+	void latestSystemMessageIsKeptFirstAndEarlierOnesAreArchived() {
+		TurnWindowCompactionStrategy strategy = TurnWindowCompactionStrategy.builder().maxTurns(1).build();
 		List<SessionEvent> events = new ArrayList<>();
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("u1")).build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("a1")).build());
-		events.add(SessionEvent.builder()
-			.sessionId(SESSION_ID)
-			.message(new UserMessage("sub-q"))
-			.branch("sub")
-			.build());
-		events.add(SessionEvent.builder()
-			.sessionId(SESSION_ID)
-			.message(new AssistantMessage("sub-a"))
-			.branch("sub")
-			.build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("u2")).build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("a2")).build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("u3")).build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("a3")).build());
+		events.add(system("Answer in French"));
+		events.addAll(turn("u1", "a1"));
+		events.add(2, system("Answer in German"));
+		events.addAll(turn("u2", "a2"));
 
 		CompactionResult result = strategy.compact(requestWith(events));
 
-		// Exactly 3 root turns; archive root turn 1 (4 events incl. branch), keep turns 2 and 3
-		assertThat(result.archivedEvents()).hasSize(4);
-		assertThat(result.compactedEvents()).hasSize(4);
-		assertThat(result.compactedEvents().get(0).getMessage().getText()).isEqualTo("u2");
-		assertThat(result.compactedEvents().get(2).getMessage().getText()).isEqualTo("u3");
+		assertThat(result.archivedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("Answer in French", "u1", "a1");
+		assertThat(result.compactedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("Answer in German", "u2", "a2");
 	}
 
 	@Test
-	void preambleScanSkipsBranchUserEvents() {
-		// Branch events appear before the first root USER — they belong to the preamble.
-		// maxTurns=1 → archive root turn 1, keep root turn 2.
+	void systemMessageSurvivesWhenItsTurnIsArchived() {
 		TurnWindowCompactionStrategy strategy = TurnWindowCompactionStrategy.builder().maxTurns(1).build();
-
-		List<SessionEvent> events = new ArrayList<>();
-		events.add(SessionEvent.builder()
-			.sessionId(SESSION_ID)
-			.message(new UserMessage("sub-q"))
-			.branch("sub")
-			.build());
-		events.add(SessionEvent.builder()
-			.sessionId(SESSION_ID)
-			.message(new AssistantMessage("sub-a"))
-			.branch("sub")
-			.build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("u1")).build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("a1")).build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("u2")).build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("a2")).build());
+		List<SessionEvent> events = new ArrayList<>(turn("u1", "a1"));
+		events.add(1, system("Researcher rules"));
+		events.addAll(turn("u2", "a2"));
 
 		CompactionResult result = strategy.compact(requestWith(events));
 
-		// Preamble [sub-q, sub-a] preserved; root turn 1 [u1, a1] archived; root turn 2 [u2, a2] kept
-		assertThat(result.archivedEvents()).hasSize(2);
-		assertThat(result.archivedEvents().get(0).getMessage().getText()).isEqualTo("u1");
-		assertThat(result.compactedEvents()).hasSize(4); // [sub-q, sub-a, u2, a2]
-		assertThat(result.compactedEvents().get(0).getMessage().getText()).isEqualTo("sub-q");
-		assertThat(result.compactedEvents().get(2).getMessage().getText()).isEqualTo("u2");
+		assertThat(result.archivedEvents()).extracting(e -> e.getMessage().getText()).containsExactly("u1", "a1");
+		assertThat(result.compactedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("Researcher rules", "u2", "a2");
 	}
 
 	// --- helpers ---
 
+	private SessionEvent system(String text) {
+		return SessionEvent.builder().sessionId(SESSION_ID).message(new SystemMessage(text)).build();
+	}
+
+
 	private List<SessionEvent> turn(String userText, String assistantText) {
 		return List.of(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage(userText)).build(),
 				SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage(assistantText)).build());
+	}
+
+	@Test
+	void compactionWithoutUserMessageArchivesNothing() {
+		// No USER event at all (e.g. only assistant and tool steps), so there is no turn
+		// boundary to cut at: nothing may be archived.
+		List<SessionEvent> events = new ArrayList<>();
+		for (int i = 1; i <= 6; i++) {
+			events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("step " + i)).build());
+			events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("answer " + i)).build());
+		}
+
+		CompactionResult result = TurnWindowCompactionStrategy.builder().maxTurns(1).build().compact(requestWith(events));
+
+		assertThat(result.archivedEvents()).isEmpty();
+		assertThat(result.compactedEvents()).containsExactlyElementsOf(events);
 	}
 
 	@SafeVarargs

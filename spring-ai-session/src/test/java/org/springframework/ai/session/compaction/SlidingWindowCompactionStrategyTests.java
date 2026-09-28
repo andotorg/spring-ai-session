@@ -22,6 +22,7 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.session.Session;
@@ -222,69 +223,121 @@ class SlidingWindowCompactionStrategyTests {
 		assertThat(result.tokensEstimatedSaved()).isGreaterThan(0);
 	}
 
-	// --- branch-awareness ---
-
 	@Test
-	void branchEventsDoNotConsumeMaxEventsSlots() {
-		// real=[u1, a1, sub-q(branch), sub-a(branch), u2, a2] → 4 root events, 2 branch
-		// maxEvents=2 → archive 2 root events (u1, a1); kept window starts at u2.
-		// Branch events between the archived and kept root turns are also archived because
-		// they fall before the snap cut point.
+	void oversizeLastTurnIsKeptInsteadOfArchivingEverything() {
+		// The last turn (u2..a4) alone holds more root events than maxEvents; the cut
+		// would snap past the end — the last turn must still be kept.
 		SlidingWindowCompactionStrategy strategy = SlidingWindowCompactionStrategy.builder().maxEvents(2).build();
-
-		List<SessionEvent> events = new ArrayList<>();
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("u1")).build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("a1")).build());
-		events.add(SessionEvent.builder()
-			.sessionId(SESSION_ID)
-			.message(new UserMessage("sub-q"))
-			.branch("sub")
-			.build());
-		events.add(SessionEvent.builder()
-			.sessionId(SESSION_ID)
-			.message(new AssistantMessage("sub-a"))
-			.branch("sub")
-			.build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("u2")).build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("a2")).build());
+		List<SessionEvent> events = List.of(user("u1"), assistant("a1"), user("u2"), assistant("a2"), assistant("a3"),
+				assistant("a4"));
 
 		CompactionResult result = strategy.compact(contextFor(events));
 
-		assertThat(result.compactedEvents()).hasSize(2);
-		assertThat(result.compactedEvents().get(0).getMessage().getText()).isEqualTo("u2");
-		assertThat(result.compactedEvents().get(1).getMessage().getText()).isEqualTo("a2");
-		assertThat(result.archivedEvents()).hasSize(4); // u1, a1, sub-q, sub-a
+		assertThat(result.archivedEvents()).extracting(e -> e.getMessage().getText()).containsExactly("u1", "a1");
+		assertThat(result.compactedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("u2", "a2", "a3", "a4");
 	}
 
 	@Test
-	void noCompactionWhenRootEventsWithinBudgetDespiteExcessTotalEvents() {
-		// real=[u1, a1, sub-q(branch), sub-a(branch), u2, a2] — 6 total, 4 root events
-		// maxEvents=4 → 4 root events <= 4 slots → no-op (branch events come for free)
-		// Old behaviour (count all real events): 6 > 4 → would compact and start window
-		// at branch USER u2-sub, which is semantically wrong.
-		SlidingWindowCompactionStrategy strategy = SlidingWindowCompactionStrategy.builder().maxEvents(4).build();
-
-		List<SessionEvent> events = new ArrayList<>();
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("u1")).build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("a1")).build());
-		events.add(SessionEvent.builder()
-			.sessionId(SESSION_ID)
-			.message(new UserMessage("sub-q"))
-			.branch("sub")
-			.build());
-		events.add(SessionEvent.builder()
-			.sessionId(SESSION_ID)
-			.message(new AssistantMessage("sub-a"))
-			.branch("sub")
-			.build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("u2")).build());
-		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("a2")).build());
+	void singleOversizeTurnIsNotCompacted() {
+		SlidingWindowCompactionStrategy strategy = SlidingWindowCompactionStrategy.builder().maxEvents(2).build();
+		List<SessionEvent> events = List.of(user("u1"), assistant("a1"), assistant("a2"), assistant("a3"));
 
 		CompactionResult result = strategy.compact(contextFor(events));
 
-		// All 6 events returned unchanged — no compaction needed
 		assertThat(result.archivedEvents()).isEmpty();
-		assertThat(result.compactedEvents()).hasSize(6);
+		assertThat(result.compactedEvents()).hasSize(4);
+	}
+
+	@Test
+	void storedSystemMessageIsNeverArchivedAndComesFirst() {
+		SlidingWindowCompactionStrategy strategy = SlidingWindowCompactionStrategy.builder().maxEvents(2).build();
+		List<SessionEvent> events = List.of(system("Answer in French"), user("u1"), assistant("a1"), user("u2"),
+				assistant("a2"));
+
+		CompactionResult result = strategy.compact(contextFor(events));
+
+		// The system message uses no slot: the same two real events are kept as without it.
+		assertThat(result.compactedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("Answer in French", "u2", "a2");
+		assertThat(result.archivedEvents()).extracting(e -> e.getMessage().getText()).containsExactly("u1", "a1");
+	}
+
+	@Test
+	void onlyTheLatestStoredSystemMessageIsKeptSoPerTurnSystemMessagesStayBounded() {
+		// Latest wins: storing a system message per turn replaces the previous one, so the
+		// active window never holds more than one stored system message.
+		SlidingWindowCompactionStrategy strategy = SlidingWindowCompactionStrategy.builder().maxEvents(3).build();
+		List<SessionEvent> events = new ArrayList<>();
+		events.add(system("Answer in French"));
+		for (int i = 1; i <= 5; i++) {
+			events.add(user("u" + i));
+			events.add(system("time " + i));
+			events.add(assistant("a" + i));
+		}
+
+		CompactionResult result = strategy.compact(contextFor(events));
+
+		// Compaction never reorders events: the kept system message stays where it was stored
+		assertThat(result.compactedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("u5", "time 5", "a5");
+		assertThat(result.archivedEvents()).extracting(e -> e.getMessage().getText())
+			.contains("Answer in French", "time 1", "time 4")
+			.doesNotContain("time 5");
+	}
+
+	@Test
+	void supersededSystemMessagesAreArchivedEvenWhenTheBudgetNeedsNoCut() {
+		SlidingWindowCompactionStrategy strategy = SlidingWindowCompactionStrategy.builder().maxEvents(20).build();
+		List<SessionEvent> events = List.of(system("Answer in French"), user("u1"), assistant("a1"),
+				system("Answer in German"));
+
+		CompactionResult result = strategy.compact(contextFor(events));
+
+		assertThat(result.archivedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("Answer in French");
+		// Compaction never reorders events: the kept system message stays where it was stored
+		assertThat(result.compactedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("u1", "a1", "Answer in German");
+	}
+
+	@Test
+	void noStoredSystemMessagesMeansAnUnchangedNoOp() {
+		SlidingWindowCompactionStrategy strategy = SlidingWindowCompactionStrategy.builder().maxEvents(20).build();
+		List<SessionEvent> events = List.of(user("u1"), assistant("a1"));
+
+		CompactionResult result = strategy.compact(contextFor(events));
+
+		assertThat(result.archivedEvents()).isEmpty();
+		assertThat(result.compactedEvents()).isEqualTo(events);
+	}
+
+	@Test
+	void systemMessageSurvivesCompactionOfTheTurnItWasStoredIn() {
+		// The latest system prompt stays active even when the turn it was stored in is
+		// archived.
+		SlidingWindowCompactionStrategy strategy = SlidingWindowCompactionStrategy.builder().maxEvents(2).build();
+		List<SessionEvent> events = List.of(user("u1"), system("Researcher rules"),
+				assistant("a1"), user("u2"), assistant("a2"), user("u3"), assistant("a3"));
+
+		CompactionResult result = strategy.compact(contextFor(events));
+
+		assertThat(result.compactedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("Researcher rules", "u3", "a3");
+		assertThat(result.archivedEvents()).extracting(e -> e.getMessage().getText())
+			.containsExactly("u1", "a1", "u2", "a2");
+	}
+
+	private static SessionEvent system(String text) {
+		return SessionEvent.builder().sessionId(SESSION_ID).message(new SystemMessage(text)).build();
+	}
+
+	private static SessionEvent user(String text) {
+		return SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage(text)).build();
+	}
+
+	private static SessionEvent assistant(String text) {
+		return SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage(text)).build();
 	}
 
 	private List<SessionEvent> buildRealEvents(int count) {
@@ -293,6 +346,22 @@ class SlidingWindowCompactionStrategyTests {
 			events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new UserMessage("msg-" + i)).build());
 		}
 		return events;
+	}
+
+	@Test
+	void compactionWithoutUserMessageArchivesNothing() {
+		// No USER event at all (e.g. only assistant and tool steps), so there is no turn
+		// boundary to cut at: nothing may be archived.
+		List<SessionEvent> events = new ArrayList<>();
+		for (int i = 1; i <= 6; i++) {
+			events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("step " + i)).build());
+			events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new AssistantMessage("answer " + i)).build());
+		}
+
+		CompactionResult result = SlidingWindowCompactionStrategy.builder().maxEvents(2).build().compact(contextFor(events));
+
+		assertThat(result.archivedEvents()).isEmpty();
+		assertThat(result.compactedEvents()).containsExactlyElementsOf(events);
 	}
 
 	private CompactionRequest contextFor(List<SessionEvent> events) {

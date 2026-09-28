@@ -16,8 +16,9 @@
 
 package org.springframework.ai.session.compaction;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.function.ToIntFunction;
+import java.util.stream.Stream;
 
 import org.springframework.ai.session.SessionEvent;
 import org.springframework.ai.tokenizer.JTokkitTokenCountEstimator;
@@ -30,24 +31,26 @@ import org.springframework.util.Assert;
  *
  * <h3>Algorithm</h3>
  * <ol>
- * <li>Separate synthetic summary events — they are always preserved and placed first in
- * the result. Their token cost is deducted from the budget before real events are
- * considered, so a large prior compaction summary reduces the space available for real
- * events.</li>
+ * <li>Separate the latest stored system message (the system prompt; earlier stored
+ * system messages are superseded and archived, see
+ * {@code CompactionUtils#pinnedSystemEvents}) and the synthetic summary events. They are
+ * always preserved, in place. Their token cost is deducted from the
+ * budget before real events are considered, so a large system prompt or prior compaction
+ * summary reduces the space available for real events.</li>
  * <li>Walk real events from newest to oldest, accumulating cost until the budget is
  * exhausted. Stops at the first event that would exceed the remaining budget, producing a
  * contiguous kept window (a suffix of the real-event list). Skipping oversize events and
  * continuing would produce non-contiguous gaps that break conversation coherence.</li>
- * <li>Snap the cut point to the next root-level ({@code branch == null}) user message.
- * This guarantees the kept window always starts at a turn boundary — sub-agent
- * {@code USER} messages are skipped because they are turn-internal, not turn starts.</li>
- * <li>Return: {@code [synthetic events] + [kept events]}.</li>
+ * <li>Snap the cut point to the next user message. This guarantees the kept window
+ * always starts at a turn boundary.</li>
+ * <li>Return every event that is not archived, in its original log order.</li>
  * </ol>
  *
  * <h3>No-op condition</h3>
  * <p>
- * If all real events fit within the token budget no events are archived and the session
- * is returned unchanged.
+ * If all real events fit within the token budget no real events are archived and the
+ * session is returned unchanged. If superseded stored system messages are present, only those are
+ * archived.
  *
  * @author Christian Tzolov
  * @since 2.0.0
@@ -75,15 +78,19 @@ public final class TokenCountCompactionStrategy implements CompactionStrategy {
 
 		List<SessionEvent> events = context.events();
 
-		// Always keep synthetic events
+		// Always keep the latest stored system message and synthetic events; earlier stored
+		// system messages are superseded and archived
+		List<SessionEvent> pinnedSystem = CompactionUtils.pinnedSystemEvents(events);
+		List<SessionEvent> supersededSystem = CompactionUtils.supersededSystemEvents(events, pinnedSystem);
 		List<SessionEvent> synthetic = events.stream().filter(SessionEvent::isSynthetic).toList();
-		List<SessionEvent> real = events.stream().filter(e -> !e.isSynthetic()).toList();
+		List<SessionEvent> real = CompactionUtils.compactableEvents(events);
+		ToIntFunction<SessionEvent> tokens = e -> this.tokenCountEstimator.estimate(CompactionUtils.formatEvent(e));
 
-		int syntheticTokens = synthetic.stream()
-			.mapToInt(e -> this.tokenCountEstimator.estimate(CompactionUtils.formatEvent(e)))
-			.sum();
+		// Preserved events are sent to the model too, so their cost comes off the budget
+		// first.
+		int preservedTokens = Stream.concat(pinnedSystem.stream(), synthetic.stream()).mapToInt(tokens).sum();
 
-		int remainingBudget = this.maxTokens - syntheticTokens;
+		int remainingBudget = this.maxTokens - preservedTokens;
 
 		// Walk from newest to oldest, accumulating events until the budget is reached.
 		// Stop at the first event that would exceed the remaining budget so the kept
@@ -92,9 +99,9 @@ public final class TokenCountCompactionStrategy implements CompactionStrategy {
 		int rawCutIndex = real.size();
 		int usedTokens = 0;
 		for (int i = real.size() - 1; i >= 0; i--) {
-			int tokens = this.tokenCountEstimator.estimate(CompactionUtils.formatEvent(real.get(i)));
-			if (usedTokens + tokens <= remainingBudget) {
-				usedTokens += tokens;
+			int eventTokens = tokens.applyAsInt(real.get(i));
+			if (usedTokens + eventTokens <= remainingBudget) {
+				usedTokens += eventTokens;
 				rawCutIndex = i;
 			}
 			else {
@@ -102,27 +109,20 @@ public final class TokenCountCompactionStrategy implements CompactionStrategy {
 			}
 		}
 
-		// Snap the raw cut forward to the nearest root-level USER event so the kept
-		// window always starts at a turn boundary. Sub-agent USER messages (branch != null)
-		// are skipped — they are turn-internal, not turn starts.
-		int cutIndex = CompactionUtils.snapToTurnStart(real, rawCutIndex);
+		// Snap the raw cut forward to the nearest USER event so the kept window always
+		// starts at a turn boundary.
+		// If no later turn start exists (the newest turn alone exceeds the budget), keep
+		// that last turn rather than archiving the whole active window.
+		int cutIndex = CompactionUtils.retainLastTurn(real, CompactionUtils.snapToTurnStart(real, rawCutIndex));
 
-		// Build kept and archived lists in chronological order
-		List<SessionEvent> kept = new ArrayList<>(real.subList(cutIndex, real.size()));
-		List<SessionEvent> archived = new ArrayList<>(real.subList(0, cutIndex));
+		List<SessionEvent> archived = real.subList(0, cutIndex);
 
 		if (archived.isEmpty()) {
-			return new CompactionResult(events, List.of(), 0);
+			return CompactionUtils.unchangedExceptSuperseded(events, supersededSystem, tokens);
 		}
 
-		List<SessionEvent> compacted = new ArrayList<>(synthetic);
-		compacted.addAll(kept);
 
-		int tokensRemoved = archived.stream()
-			.mapToInt(e -> this.tokenCountEstimator.estimate(CompactionUtils.formatEvent(e)))
-			.sum();
-
-		return new CompactionResult(compacted, archived, tokensRemoved);
+		return CompactionUtils.archiving(events, archived, supersededSystem, tokens);
 	}
 
 	public int getMaxTokens() {
@@ -143,11 +143,13 @@ public final class TokenCountCompactionStrategy implements CompactionStrategy {
 		}
 
 		public Builder maxTokens(int maxTokens) {
+			Assert.isTrue(maxTokens > 0, "maxTokens must be greater than 0");
 			this.maxTokens = maxTokens;
 			return this;
 		}
 
 		public Builder tokenCountEstimator(TokenCountEstimator tokenCountEstimator) {
+			Assert.notNull(tokenCountEstimator, "tokenCountEstimator must not be null");
 			this.tokenCountEstimator = tokenCountEstimator;
 			return this;
 		}

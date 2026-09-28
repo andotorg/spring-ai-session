@@ -22,6 +22,7 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.content.MediaContent;
 import org.springframework.ai.session.Session;
@@ -61,9 +62,10 @@ class TokenCountTriggerTests {
 
 	@Test
 	void firesWhenTokenCountReachesThreshold() {
-		// "hello"(5) + "world"(5) = 10 tokens, threshold = 10 → fires (>=)
+		// "User: hello" (11) + "Assistant: world" (16) = exactly 27 chars.
+		// threshold = 27
 		TokenCountTrigger trigger = TokenCountTrigger.builder()
-			.threshold(10)
+			.threshold(27)
 			.tokenCountEstimator(CHAR_ESTIMATOR)
 			.build();
 		CompactionRequest request = requestWith(turn("hello", "world"));
@@ -73,9 +75,10 @@ class TokenCountTriggerTests {
 
 	@Test
 	void firesWhenTokenCountExceedsThreshold() {
-		// "hello"(5) + "world!"(6) = 11 tokens, threshold = 10
+		// "User: hello" (11) + "Assistant: world!" (17) = exactly 28 chars.
+		// threshold = 27
 		TokenCountTrigger trigger = TokenCountTrigger.builder()
-			.threshold(10)
+			.threshold(27)
 			.tokenCountEstimator(CHAR_ESTIMATOR)
 			.build();
 		CompactionRequest request = requestWith(turn("hello", "world!"));
@@ -85,9 +88,10 @@ class TokenCountTriggerTests {
 
 	@Test
 	void doesNotFireWhenTokenCountBelowThreshold() {
-		// "hi"(2) + "ok"(2) = 4 tokens, threshold = 10
+		// "User: hi" (8) + "Assistant: ok" (13) = exactly 21 chars.
+		// threshold = 22
 		TokenCountTrigger trigger = TokenCountTrigger.builder()
-			.threshold(10)
+			.threshold(22)
 			.tokenCountEstimator(CHAR_ESTIMATOR)
 			.build();
 		CompactionRequest request = requestWith(turn("hi", "ok"));
@@ -108,9 +112,11 @@ class TokenCountTriggerTests {
 
 	@Test
 	void countsTokensAcrossAllEvents() {
-		// Two turns: "ab"(2)+"cd"(2) + "ef"(2)+"gh"(2) = 8 tokens, threshold = 7
+		// Turn 1: "User: ab" (8) + "Assistant: cd" (13) = 21 chars
+		// Turn 2: "User: ef" (8) + "Assistant: gh" (13) = 21 chars
+		// Total = 42 chars. threshold = 41
 		TokenCountTrigger trigger = TokenCountTrigger.builder()
-			.threshold(7)
+			.threshold(35)
 			.tokenCountEstimator(CHAR_ESTIMATOR)
 			.build();
 		CompactionRequest request = requestWith(turn("ab", "cd"), turn("ef", "gh"));
@@ -136,6 +142,37 @@ class TokenCountTriggerTests {
 		assertThatIllegalArgumentException()
 			.isThrownBy(() -> TokenCountTrigger.builder().threshold(100).tokenCountEstimator(null).build())
 			.withMessageContaining("tokenCountEstimator must not be null");
+	}
+
+	@Test
+	void builderDefaultsToJTokkitEstimator() {
+		TokenCountTrigger trigger = TokenCountTrigger.builder().threshold(1).build();
+
+		assertThat(trigger.shouldCompact(requestWith(turn("hello", "world")))).isTrue();
+		assertThat(trigger.shouldCompact(requestWith(List.of()))).isFalse();
+	}
+
+	@Test
+	void supersededSystemMessagesDoNotCountTowardTheThreshold() {
+		// Measures what the strategy budgets: the latest system message, the summaries and
+		// the conversation. Superseded system messages are not sent, so they must not make
+		// the trigger fire.
+		// "System: new" (11) + "User: hi" (8) + "Assistant: ok" (13) = 32.
+		TokenCountTrigger trigger = TokenCountTrigger.builder()
+			.threshold(33)
+			.tokenCountEstimator(CHAR_ESTIMATOR)
+			.build();
+		List<SessionEvent> events = new ArrayList<>();
+		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new SystemMessage("old xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")).build());
+		events.add(SessionEvent.builder().sessionId(SESSION_ID).message(new SystemMessage("new")).build());
+		events.addAll(turn("hi", "ok"));
+
+		assertThat(trigger.shouldCompact(requestWith(events))).isFalse();
+		assertThat(TokenCountTrigger.builder()
+			.threshold(32)
+			.tokenCountEstimator(CHAR_ESTIMATOR)
+			.build()
+			.shouldCompact(requestWith(events))).isTrue();
 	}
 
 	@Test

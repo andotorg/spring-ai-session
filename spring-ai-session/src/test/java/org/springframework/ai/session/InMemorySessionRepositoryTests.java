@@ -42,6 +42,34 @@ class InMemorySessionRepositoryTests {
 	}
 
 	@Test
+	void saveIfAbsentNeverOverwritesAnExistingSession() {
+		assertThat(this.repository.saveIfAbsent(Session.builder().id("s-1").userId("alice").build())).isTrue();
+		assertThat(this.repository.saveIfAbsent(Session.builder().id("s-1").userId("mallory").build())).isFalse();
+		assertThat(this.repository.findById("s-1").userId()).isEqualTo("alice");
+	}
+
+	@Test
+	void saveOfExistingSessionKeepsCreatedAtAndEvents() {
+		Instant created = Instant.parse("2026-01-01T00:00:00Z");
+		this.repository.save(Session.builder().id("s-1").userId("user-1").createdAt(created).build());
+		this.repository.appendEvent(SessionEvent.builder()
+			.sessionId("s-1")
+			.message(new UserMessage("kept"))
+			.build());
+
+		Session updated = this.repository.save(Session.builder()
+			.id("s-1")
+			.userId("user-2")
+			.createdAt(Instant.parse("2026-06-01T00:00:00Z"))
+			.build());
+
+		assertThat(updated.createdAt()).isEqualTo(created);
+		assertThat(this.repository.findById("s-1").createdAt()).isEqualTo(created);
+		assertThat(this.repository.findById("s-1").userId()).isEqualTo("user-2");
+		assertThat(this.repository.findEvents("s-1", EventFilter.all())).hasSize(1);
+	}
+
+	@Test
 	void saveAndFindByIdRoundTrip() {
 		Session session = buildSession("user-1");
 
@@ -64,6 +92,35 @@ class InMemorySessionRepositoryTests {
 		SessionEvent event = SessionEvent.builder().sessionId("ghost-session").message(new UserMessage("hi")).build();
 		assertThatThrownBy(() -> repo.appendEvent(event)).isInstanceOf(IllegalArgumentException.class)
 			.hasMessageContaining("Session not found");
+	}
+
+	@Test
+	void appendEventWithSameIdIsIdempotent() {
+		Session session = this.repository.save(buildSession("user-1"));
+		SessionEvent event = SessionEvent.builder()
+			.id("deterministic-event-id")
+			.sessionId(session.id())
+			.message(new UserMessage("hi"))
+			.build();
+
+		this.repository.appendEvent(event);
+		long versionAfterFirst = this.repository.getEventVersion(session.id());
+		this.repository.appendEvent(event);
+		long versionAfterReplay = this.repository.getEventVersion(session.id());
+
+		assertThat(this.repository.findEvents(session.id(), EventFilter.all())).hasSize(1);
+		assertThat(versionAfterReplay).isEqualTo(versionAfterFirst);
+	}
+
+	@Test
+	void appendEventWithDifferentIdIsNotTreatedAsDuplicate() {
+		Session session = this.repository.save(buildSession("user-1"));
+		this.repository.appendEvent(
+				SessionEvent.builder().sessionId(session.id()).message(new UserMessage("first")).build());
+		this.repository.appendEvent(
+				SessionEvent.builder().sessionId(session.id()).message(new UserMessage("second")).build());
+
+		assertThat(this.repository.findEvents(session.id(), EventFilter.all())).hasSize(2);
 	}
 
 	@Test
@@ -242,6 +299,34 @@ class InMemorySessionRepositoryTests {
 		assertThat(this.repository.findEvents(session.id(), EventFilter.active()))
 			.extracting(e -> e.getMessage().getText())
 			.containsExactly("s2", "e3");
+	}
+
+	@Test
+	void findEventsWithAHugePageNumberReturnsAnEmptyPage() {
+		Session session = buildSession("user-page");
+		this.repository.save(session);
+		this.repository
+			.appendEvent(SessionEvent.builder().sessionId(session.id()).message(new UserMessage("hello")).build());
+
+		// page * pageSize overflows an int
+		EventFilter filter = EventFilter.builder().page(Integer.MAX_VALUE).pageSize(10).build();
+
+		assertThat(this.repository.findEvents(session.id(), filter)).isEmpty();
+	}
+
+	@Test
+	void deleteExpiredSessionsDeletesOnlyExpiredSessions() {
+		Instant now = Instant.now();
+		this.repository
+			.save(Session.builder().id("expired").userId("user-ttl").expiresAt(now.minusSeconds(60)).build());
+		this.repository
+			.save(Session.builder().id("extended").userId("user-ttl").expiresAt(now.plusSeconds(60)).build());
+		this.repository.save(Session.builder().id("no-ttl").userId("user-ttl").build());
+
+		assertThat(this.repository.deleteExpiredSessions(now)).isEqualTo(1);
+		assertThat(this.repository.findById("expired")).isNull();
+		assertThat(this.repository.findById("extended")).isNotNull();
+		assertThat(this.repository.findById("no-ttl")).isNotNull();
 	}
 
 	private Session buildSession(String userId) {

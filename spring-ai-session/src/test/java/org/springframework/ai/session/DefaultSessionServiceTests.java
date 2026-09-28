@@ -18,21 +18,29 @@ package org.springframework.ai.session;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.session.compaction.CompactionResult;
 import org.springframework.ai.session.compaction.SlidingWindowCompactionStrategy;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
+import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
 
 /**
  * Tests for {@link DefaultSessionService}.
@@ -46,6 +54,45 @@ class DefaultSessionServiceTests {
 		this.service = DefaultSessionService.builder()
 			.sessionRepository(InMemorySessionRepository.builder().build())
 			.build();
+	}
+
+	@Test
+	void storingASystemMessageIsRejectedByDefault() {
+		Session session = this.service.create(CreateSessionRequest.builder().userId("user-1").build());
+
+		assertThatIllegalArgumentException()
+			.isThrownBy(() -> this.service.appendMessage(session.id(), new SystemMessage("Answer in French.")))
+			.withMessageContaining(session.id())
+			.withMessageContaining("allowSystemMessages(true)")
+			.withMessageContaining("spring.ai.session.allow-system-messages=true");
+		assertThat(this.service.getEvents(session.id())).isEmpty();
+	}
+
+	@Test
+	void storingASystemMessageIsAllowedWhenEnabled() {
+		SessionService permissive = DefaultSessionService.builder()
+			.sessionRepository(InMemorySessionRepository.builder().build())
+			.allowSystemMessages(true)
+			.build();
+		Session session = permissive.create(CreateSessionRequest.builder().userId("user-1").build());
+
+		permissive.appendMessage(session.id(), new SystemMessage("Answer in French."));
+
+		assertThat(permissive.getMessages(session.id())).extracting(Message::getText)
+			.containsExactly("Answer in French.");
+	}
+
+	@Test
+	void conversationMessagesAreUnaffectedByTheSystemMessageRule() {
+		Session session = this.service.create(CreateSessionRequest.builder().userId("user-1").build());
+
+		this.service.appendMessage(session.id(), new UserMessage("hi"));
+		this.service.appendMessage(session.id(), new AssistantMessage("hello"));
+		this.service.appendMessage(session.id(), ToolResponseMessage.builder()
+			.responses(List.of(new ToolResponseMessage.ToolResponse("call-1", "tool", "ok")))
+			.build());
+
+		assertThat(this.service.getEvents(session.id())).hasSize(3);
 	}
 
 	@Test
@@ -89,6 +136,51 @@ class DefaultSessionServiceTests {
 			.create(CreateSessionRequest.builder().userId("user-1").timeToLive(Duration.ofMinutes(30)).build());
 
 		assertThat(session.expiresAt()).isBefore(before.plus(Duration.ofHours(1)));
+	}
+
+	@Test
+	void createWithExistingIdIsRejectedAndDoesNotReassignOwner() {
+		Session original = this.service.create(CreateSessionRequest.builder().id("fixed-id").userId("alice").build());
+
+		assertThatIllegalStateException().isThrownBy(() -> this.service.create(CreateSessionRequest.builder().id("fixed-id").userId("mallory").build()))
+			.withMessageContaining("already exists");
+
+		assertThat(this.service.findById(original.id()).userId()).isEqualTo("alice");
+	}
+
+	@Test
+	void concurrentCreatesOfSameIdHaveExactlyOneWinner() throws Exception {
+		int callers = 8;
+		ExecutorService executor = Executors.newFixedThreadPool(callers);
+		try {
+			CountDownLatch start = new CountDownLatch(1);
+			List<Future<Session>> results = new ArrayList<>();
+			for (int i = 0; i < callers; i++) {
+				String userId = "user-" + i;
+				results.add(executor.submit(() -> {
+					start.await();
+					return this.service.create(CreateSessionRequest.builder().id("contended").userId(userId).build());
+				}));
+			}
+			start.countDown();
+			List<Session> winners = new ArrayList<>();
+			int rejected = 0;
+			for (Future<Session> result : results) {
+				try {
+					winners.add(result.get(30, TimeUnit.SECONDS));
+				}
+				catch (ExecutionException ex) {
+					assertThat(ex.getCause()).isInstanceOf(IllegalStateException.class);
+					rejected++;
+				}
+			}
+			assertThat(winners).hasSize(1);
+			assertThat(rejected).isEqualTo(callers - 1);
+			assertThat(this.service.findById("contended").userId()).isEqualTo(winners.get(0).userId());
+		}
+		finally {
+			executor.shutdownNow();
+		}
 	}
 
 	@Test

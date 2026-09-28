@@ -20,6 +20,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 import javax.sql.DataSource;
 
@@ -28,11 +29,17 @@ import org.junit.jupiter.api.Test;
 
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.MessageType;
+import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.session.CreateSessionRequest;
+import org.springframework.ai.session.DefaultSessionService;
 import org.springframework.ai.session.EventFilter;
+import org.springframework.ai.session.EventFilter.MatchMode;
 import org.springframework.ai.session.Session;
 import org.springframework.ai.session.SessionEvent;
+import org.springframework.ai.session.SessionService;
+import org.springframework.ai.session.compaction.SlidingWindowCompactionStrategy;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration;
 import org.springframework.boot.jdbc.autoconfigure.JdbcTemplateAutoConfiguration;
@@ -187,6 +194,37 @@ class JdbcSessionRepositoryTests {
 	}
 
 	@Test
+	void appendEventWithSameIdIsIdempotent() {
+		Session session = buildSession("user-1");
+		this.repository.save(session);
+		SessionEvent event = SessionEvent.builder()
+			.id("deterministic-event-id")
+			.sessionId(session.id())
+			.message(new UserMessage("hi"))
+			.build();
+
+		this.repository.appendEvent(event);
+		long versionAfterFirst = this.repository.getEventVersion(session.id());
+		this.repository.appendEvent(event);
+		long versionAfterReplay = this.repository.getEventVersion(session.id());
+
+		assertThat(this.repository.findEvents(session.id(), EventFilter.all())).hasSize(1);
+		assertThat(versionAfterReplay).isEqualTo(versionAfterFirst);
+	}
+
+	@Test
+	void appendEventWithDifferentIdIsNotTreatedAsDuplicate() {
+		Session session = buildSession("user-1");
+		this.repository.save(session);
+		this.repository.appendEvent(
+				SessionEvent.builder().sessionId(session.id()).message(new UserMessage("first")).build());
+		this.repository.appendEvent(
+				SessionEvent.builder().sessionId(session.id()).message(new UserMessage("second")).build());
+
+		assertThat(this.repository.findEvents(session.id(), EventFilter.all())).hasSize(2);
+	}
+
+	@Test
 	void appendedEventsAreReturnedInChronologicalOrder() {
 		Session session = buildSession("user-order");
 		this.repository.save(session);
@@ -283,6 +321,93 @@ class JdbcSessionRepositoryTests {
 		List<SessionEvent> results = this.repository.findEvents(session.id(), EventFilter.keywordSearch("hello"));
 		assertThat(results).hasSize(2);
 		assertThat(results).allMatch(e -> e.getMessage().getText().toLowerCase().contains("hello"));
+	}
+
+	@Test
+	void findEventsKeywordsAnyMatchSearch() {
+		Session session = buildSession("user-kws-any");
+		this.repository.save(session);
+
+		this.repository.appendEvent(
+				SessionEvent.builder().sessionId(session.id()).message(new UserMessage("we decided to ship it")).build());
+		this.repository.appendEvent(SessionEvent.builder()
+			.sessionId(session.id())
+			.message(new UserMessage("let's go with option B"))
+			.build());
+		this.repository.appendEvent(
+				SessionEvent.builder().sessionId(session.id()).message(new UserMessage("unrelated message")).build());
+
+		List<SessionEvent> results = this.repository.findEvents(session.id(),
+				EventFilter.keywordsSearch(List.of("we decided", "let's go with"), MatchMode.ANY));
+
+		assertThat(results).extracting(e -> e.getMessage().getText())
+			.containsExactlyInAnyOrder("we decided to ship it", "let's go with option B");
+	}
+
+	@Test
+	void findEventsKeywordsAllMatchSearchRequiresEveryTerm() {
+		Session session = buildSession("user-kws-all");
+		this.repository.save(session);
+
+		this.repository.appendEvent(SessionEvent.builder()
+			.sessionId(session.id())
+			.message(new UserMessage("actually, let's use this instead"))
+			.build());
+		this.repository.appendEvent(
+				SessionEvent.builder().sessionId(session.id()).message(new UserMessage("actually that's fine as-is")).build());
+
+		List<SessionEvent> results = this.repository.findEvents(session.id(),
+				EventFilter.keywordsSearch(List.of("actually", "instead"), MatchMode.ALL));
+
+		assertThat(results).extracting(e -> e.getMessage().getText())
+			.containsExactly("actually, let's use this instead");
+	}
+
+	@Test
+	void findEventsPatternSearch() {
+		Session session = buildSession("user-pattern");
+		this.repository.save(session);
+
+		this.repository.appendEvent(
+				SessionEvent.builder().sessionId(session.id()).message(new UserMessage("we decided on option B")).build());
+		this.repository.appendEvent(
+				SessionEvent.builder().sessionId(session.id()).message(new UserMessage("we haven't decided yet")).build());
+
+		List<SessionEvent> results = this.repository.findEvents(session.id(),
+				EventFilter.patternSearch(Pattern.compile("\\bwe decided\\b")));
+
+		assertThat(results).extracting(e -> e.getMessage().getText()).containsExactly("we decided on option B");
+	}
+
+	@Test
+	void findEventsPatternSearchCombinedWithPagination() {
+		Session session = buildSession("user-pattern-page");
+		this.repository.save(session);
+
+		// Ordering is by insertion-derived `seq`, not timestamp, so the non-matching
+		// event must be interleaved by *append order* — inserted between entry 2 and
+		// entry 3 — to actually prove the pattern filter is applied before pagination
+		// slices the result, not just after (offset=2 on the unfiltered 7-row set would
+		// wrongly land on "no match here" instead of entry 3 if pagination ran in SQL).
+		appendEntry(session.id(), 1);
+		appendEntry(session.id(), 2);
+		this.repository.appendEvent(
+				SessionEvent.builder().sessionId(session.id()).message(new UserMessage("no match here")).build());
+		appendEntry(session.id(), 3);
+		appendEntry(session.id(), 4);
+		appendEntry(session.id(), 5);
+		appendEntry(session.id(), 6);
+
+		List<SessionEvent> page0 = this.repository.findEvents(session.id(),
+				EventFilter.builder().pattern(Pattern.compile("^entry \\d$")).page(0).pageSize(2).build());
+		List<SessionEvent> page1 = this.repository.findEvents(session.id(),
+				EventFilter.builder().pattern(Pattern.compile("^entry \\d$")).page(1).pageSize(2).build());
+		List<SessionEvent> page2 = this.repository.findEvents(session.id(),
+				EventFilter.builder().pattern(Pattern.compile("^entry \\d$")).page(2).pageSize(2).build());
+
+		assertThat(page0).extracting(e -> e.getMessage().getText()).containsExactly("entry 1", "entry 2");
+		assertThat(page1).extracting(e -> e.getMessage().getText()).containsExactly("entry 3", "entry 4");
+		assertThat(page2).extracting(e -> e.getMessage().getText()).containsExactly("entry 5", "entry 6");
 	}
 
 	@Test
@@ -404,6 +529,105 @@ class JdbcSessionRepositoryTests {
 	}
 
 	@Test
+	void keywordWildcardCharactersMatchLiterally() {
+		DialectScenarios.keywordWildcardCharactersMatchLiterally(this.repository);
+	}
+
+	@Test
+	void timestampsAreStoredAsUtcRegardlessOfJvmTimeZone() {
+		DialectScenarios.timestampsAreStoredAsUtcRegardlessOfJvmTimeZone(this.repository, this.jdbcTemplate);
+	}
+
+	@Test
+	void concurrentCreatesOfSameIdHaveExactlyOneWinner() throws Exception {
+		DialectScenarios.concurrentCreatesOfSameIdHaveExactlyOneWinner(this.repository);
+	}
+
+	@Test
+	void appendReplayInsideACallerTransactionKeepsItUsable() {
+		DialectScenarios.appendReplayInsideACallerTransactionKeepsItUsable(this.repository, this.jdbcTemplate);
+	}
+
+	@Test
+	void deleteExpiredSessionsDeletesOnlyExpiredSessions() {
+		DialectScenarios.deleteExpiredSessionsDeletesOnlyExpiredSessions(this.repository);
+	}
+
+	@Test
+	void repeatedRecursiveSummarizationNeverReordersTheLog() {
+		DialectScenarios.repeatedRecursiveSummarizationNeverReordersTheLog(this.repository);
+	}
+
+	@Test
+	void upsertKeepsCreatedAtAndEvents() {
+		DialectScenarios.upsertKeepsCreatedAtAndEvents(this.repository);
+	}
+
+	@Test
+	void appendEventWithIdOfAnotherSessionIsRejected() {
+		Session first = buildSession("user-a");
+		Session second = buildSession("user-b");
+		this.repository.save(first);
+		this.repository.save(second);
+		this.repository.appendEvent(
+				SessionEvent.builder().id("shared-id").sessionId(first.id()).message(new UserMessage("a")).build());
+
+		SessionEvent clash = SessionEvent.builder()
+			.id("shared-id")
+			.sessionId(second.id())
+			.message(new UserMessage("b"))
+			.build();
+
+		assertThatThrownBy(() -> this.repository.appendEvent(clash)).isInstanceOf(IllegalStateException.class)
+			.hasMessageContaining("another session");
+		assertThat(this.repository.findEvents(second.id(), EventFilter.all())).isEmpty();
+		assertThat(this.repository.getEventVersion(second.id())).isZero();
+	}
+
+	@Test
+	void compactEventsRejectsArchivedEventFromAnotherSession() {
+		Session session = buildSession("user-x");
+		Session other = buildSession("user-y");
+		this.repository.save(session);
+		this.repository.save(other);
+		SessionEvent own = SessionEvent.builder().sessionId(session.id()).message(new UserMessage("own")).build();
+		SessionEvent foreign = SessionEvent.builder().sessionId(other.id()).message(new UserMessage("foreign")).build();
+		this.repository.appendEvent(own);
+		this.repository.appendEvent(foreign);
+		long version = this.repository.getEventVersion(session.id());
+
+		assertThatThrownBy(
+				() -> this.repository.compactEvents(session.id(), List.of(own, foreign), List.of(), version))
+			.isInstanceOf(IllegalArgumentException.class);
+
+		// Rolled back: nothing archived, deleted or version-bumped in either session.
+		assertThat(this.repository.getEventVersion(session.id())).isEqualTo(version);
+		assertThat(this.repository.findEvents(session.id(), EventFilter.active())).hasSize(1);
+		assertThat(this.repository.findEvents(other.id(), EventFilter.active())).hasSize(1);
+	}
+
+	@Test
+	void storedSystemMessageSurvivesCompactionAndIsReadBackFirst() {
+		SessionService service = DefaultSessionService.builder()
+			.sessionRepository(this.repository)
+			.allowSystemMessages(true)
+			.build();
+		Session session = service.create(CreateSessionRequest.builder().userId("user-sys").build());
+		service.appendMessage(session.id(), new SystemMessage("Answer in French."));
+		for (int i = 1; i <= 3; i++) {
+			service.appendMessage(session.id(), new UserMessage("question " + i));
+			service.appendMessage(session.id(), new AssistantMessage("answer " + i));
+		}
+
+		service.compact(session.id(), req -> true, SlidingWindowCompactionStrategy.builder().maxEvents(2).build());
+
+		List<SessionEvent> active = this.repository.findEvents(session.id(), EventFilter.active());
+		assertThat(active).extracting(e -> e.getMessage().getText())
+			.containsExactly("Answer in French.", "question 3", "answer 3");
+		assertThat(active.get(0).getMessageType()).isEqualTo(MessageType.SYSTEM);
+	}
+
+	@Test
 	void compactEventsIncrementsVersion() {
 		Session session = buildSession("user-rv");
 		this.repository.save(session);
@@ -497,67 +721,150 @@ class JdbcSessionRepositoryTests {
 			.containsExactly("s2", "e3");
 	}
 
-	// -------------------------------------------------------------------------
-	// Branch filtering
-	// -------------------------------------------------------------------------
-
 	@Test
-	void findEventsWithBranchFilterDelegatesToDialect() {
-		// Verify that the branch filter SQL comes from the dialect, not hardcoded.
-		// A custom dialect that wraps H2's fragment with a recognizable comment is used
-		// to confirm the call is made.
-		JdbcSessionRepository repoWithCustomDialect = JdbcSessionRepository.builder()
-			.dataSource(this.dataSource)
-			.dialect(new H2JdbcSessionRepositoryDialect() {
-				@Override
-				public String getBranchFilterFragment() {
-					return super.getBranchFilterFragment(); // delegates to default || impl
-				}
-			})
-			.build();
+	void multipleCompactionsPreserveOrderAndGC() {
+		Session session = buildSession("user-multi-compact");
+		this.repository.save(session);
 
-		Session session = buildSession("user-dialect-wiring");
-		repoWithCustomDialect.save(session);
-		repoWithCustomDialect.appendEvent(
-				SessionEvent.builder().sessionId(session.id()).message(new UserMessage("root")).branch(null).build());
-		repoWithCustomDialect.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new UserMessage("child"))
-			.branch("a.b")
-			.build());
+		// 1. Initial messages
+		this.repository.appendEvent(SessionEvent.builder().sessionId(session.id()).message(new UserMessage("m1")).build());
+		this.repository.appendEvent(SessionEvent.builder().sessionId(session.id()).message(new UserMessage("m2")).build());
+		this.repository.appendEvent(SessionEvent.builder().sessionId(session.id()).message(new UserMessage("m3")).build());
 
-		List<SessionEvent> forChild = repoWithCustomDialect.findEvents(session.id(), EventFilter.forBranch("a.b"));
-		assertThat(forChild).hasSize(2); // root + exact match
+		List<SessionEvent> initial = this.repository.findEvents(session.id(), EventFilter.all());
+		
+		// First compaction: archive m1, m2. retain summary1, m3.
+		SessionEvent summary1 = SessionEvent.builder().sessionId(session.id()).message(new UserMessage("summary1")).build();
+		this.repository.compactEvents(session.id(), 
+			List.of(initial.get(0), initial.get(1)), // m1, m2
+			List.of(summary1, initial.get(2)),       // summary1, m3
+			this.repository.getEventVersion(session.id()));
+
+		// 2. Append more messages
+		this.repository.appendEvent(SessionEvent.builder().sessionId(session.id()).message(new UserMessage("m4")).build());
+		this.repository.appendEvent(SessionEvent.builder().sessionId(session.id()).message(new UserMessage("m5")).build());
+
+		List<SessionEvent> afterFirst = this.repository.findEvents(session.id(), EventFilter.all());
+		// Expected: m1(archived), m2(archived), summary1, m3, m4, m5
+		assertThat(afterFirst).hasSize(6);
+		assertThat(afterFirst.get(2).getMessage().getText()).isEqualTo("summary1");
+
+		// Second compaction: archive summary1, m3, m4. retain summary2, m5.
+		// Note that summary1 was an active event. It will be archived now.
+		SessionEvent summary2 = SessionEvent.builder().sessionId(session.id()).message(new UserMessage("summary2")).build();
+		this.repository.compactEvents(session.id(), 
+			List.of(afterFirst.get(2), afterFirst.get(3), afterFirst.get(4)), // summary1, m3, m4
+			List.of(summary2, afterFirst.get(5)),                             // summary2, m5
+			this.repository.getEventVersion(session.id()));
+
+		// 3. Append another
+		this.repository.appendEvent(SessionEvent.builder().sessionId(session.id()).message(new UserMessage("m6")).build());
+
+		List<SessionEvent> finalEvents = this.repository.findEvents(session.id(), EventFilter.all());
+		
+		// Expected: m1, m2, summary1, m3, m4 (all archived), then summary2, m5, m6 (active)
+		assertThat(finalEvents).hasSize(8);
+		assertThat(finalEvents).extracting(e -> e.getMessage().getText())
+			.containsExactly("m1", "m2", "summary1", "m3", "m4", "summary2", "m5", "m6");
+		
+		assertThat(finalEvents).extracting(SessionEvent::isArchived)
+			.containsExactly(true, true, true, true, true, false, false, false);
 	}
 
 	@Test
-	void findEventsWithBranchFilterIsolatesPeerAgents() {
-		Session session = buildSession("user-branch");
+	void compactEventsGarbageCollectsDroppedSummaries() {
+		Session session = buildSession("user-gc");
 		this.repository.save(session);
 
-		this.repository.appendEvent(
-				SessionEvent.builder().sessionId(session.id()).message(new UserMessage("root")).branch(null).build());
-		this.repository.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new UserMessage("by orchestrator"))
-			.branch("orch")
-			.build());
-		this.repository.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new UserMessage("by researcher"))
-			.branch("orch.researcher")
-			.build());
-		this.repository.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new UserMessage("by writer"))
-			.branch("orch.writer")
-			.build());
+		this.repository.appendEvent(SessionEvent.builder().sessionId(session.id()).message(new UserMessage("m1")).build());
+		this.repository.appendEvent(SessionEvent.builder().sessionId(session.id()).message(new UserMessage("summary-stale")).build());
+		this.repository.appendEvent(SessionEvent.builder().sessionId(session.id()).message(new UserMessage("m2")).build());
 
-		List<SessionEvent> forResearcher = this.repository.findEvents(session.id(),
-				EventFilter.forBranch("orch.researcher"));
+		List<SessionEvent> initial = this.repository.findEvents(session.id(), EventFilter.all());
+		
+		// Compact: archive m1. retain summary-new, m2.
+		// We explicitly do NOT include summary-stale in either list. It should be garbage collected.
+		SessionEvent summaryNew = SessionEvent.builder().sessionId(session.id()).message(new UserMessage("summary-new")).build();
+		this.repository.compactEvents(session.id(), 
+			List.of(initial.get(0)), // m1
+			List.of(summaryNew, initial.get(2)), // summary-new, m2
+			this.repository.getEventVersion(session.id()));
 
-		assertThat(forResearcher).hasSize(3);
-		assertThat(forResearcher).noneMatch(e -> "by writer".equals(e.getMessage().getText()));
+		List<SessionEvent> finalEvents = this.repository.findEvents(session.id(), EventFilter.all());
+		
+		// Expected: m1, summary-new, m2
+		assertThat(finalEvents).hasSize(3);
+		assertThat(finalEvents).extracting(e -> e.getMessage().getText())
+			.containsExactly("m1", "summary-new", "m2");
+	}
+
+	@Test
+	void compactionWithoutNewEventsDoesNotReinsertKeptRows() {
+		Session session = buildSession("user-seq");
+		this.repository.save(session);
+		for (String text : List.of("u1", "a1", "u2", "a2", "u3", "a3")) {
+			this.repository
+				.appendEvent(SessionEvent.builder().sessionId(session.id()).message(new UserMessage(text)).build());
+		}
+		List<Long> seqsBefore = this.jdbcTemplate.queryForList(
+				"SELECT seq FROM AI_SESSION_EVENT WHERE session_id = ? ORDER BY seq", Long.class, session.id());
+		DefaultSessionService service = DefaultSessionService.builder().sessionRepository(this.repository).build();
+
+		service.compact(session.id(), request -> true, SlidingWindowCompactionStrategy.builder().maxEvents(2).build());
+
+		// Nothing was inserted, so every row keeps its seq: archiving happens in place
+		assertThat(this.jdbcTemplate.queryForList("SELECT seq FROM AI_SESSION_EVENT WHERE session_id = ? ORDER BY seq",
+				Long.class, session.id())).isEqualTo(seqsBefore);
+		assertThat(this.repository.findEvents(session.id(), EventFilter.active()))
+			.extracting(e -> e.getMessage().getText())
+			.containsExactly("u3", "a3");
+	}
+
+	@Test
+	void retainedEventThatIsAlreadyArchivedStaysInPlace() {
+		Session session = buildSession("user-retained-archived");
+		this.repository.save(session);
+		SessionEvent e1 = SessionEvent.builder().sessionId(session.id()).message(new UserMessage("e1")).build();
+		SessionEvent e2 = SessionEvent.builder().sessionId(session.id()).message(new UserMessage("e2")).build();
+		SessionEvent e3 = SessionEvent.builder().sessionId(session.id()).message(new UserMessage("e3")).build();
+		this.repository.appendEvent(e1);
+		this.repository.appendEvent(e2);
+		this.repository.appendEvent(e3);
+		this.repository.compactEvents(session.id(), List.of(e1), List.of(e2, e3),
+				this.repository.getEventVersion(session.id()));
+		SessionEvent summary = SessionEvent.builder()
+			.sessionId(session.id())
+			.message(new UserMessage("summary"))
+			.build();
+
+		// e1 is already archived but listed as retained: it is an existing event, not a new one
+		this.repository.compactEvents(session.id(), List.of(e2), List.of(e1, summary, e3),
+				this.repository.getEventVersion(session.id()));
+
+		List<SessionEvent> log = this.repository.findEvents(session.id(), EventFilter.all());
+		assertThat(log).extracting(e -> e.getMessage().getText()).containsExactly("e1", "e2", "summary", "e3");
+		assertThat(log).extracting(SessionEvent::isArchived).containsExactly(true, true, false, false);
+	}
+
+	@Test
+	void compactEventsRejectsANewEventOfAnotherSession() {
+		Session session = buildSession("user-foreign-new");
+		this.repository.save(session);
+		SessionEvent e1 = SessionEvent.builder().sessionId(session.id()).message(new UserMessage("e1")).build();
+		this.repository.appendEvent(e1);
+		SessionEvent foreign = SessionEvent.builder()
+			.sessionId("another-session")
+			.message(new UserMessage("foreign"))
+			.build();
+		long version = this.repository.getEventVersion(session.id());
+
+		assertThatThrownBy(() -> this.repository.compactEvents(session.id(), List.of(), List.of(foreign, e1), version))
+			.isInstanceOf(IllegalArgumentException.class);
+		// The whole call is rolled back
+		assertThat(this.repository.getEventVersion(session.id())).isEqualTo(version);
+		assertThat(this.repository.findEvents(session.id(), EventFilter.all()))
+			.extracting(e -> e.getMessage().getText())
+			.containsExactly("e1");
 	}
 
 	// -------------------------------------------------------------------------
@@ -566,6 +873,11 @@ class JdbcSessionRepositoryTests {
 
 	private Session buildSession(String userId) {
 		return Session.builder().id(UUID.randomUUID().toString()).userId(userId).build();
+	}
+
+	private void appendEntry(String sessionId, int n) {
+		this.repository
+			.appendEvent(SessionEvent.builder().sessionId(sessionId).message(new UserMessage("entry " + n)).build());
 	}
 
 	// -------------------------------------------------------------------------

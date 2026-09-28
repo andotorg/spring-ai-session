@@ -23,6 +23,7 @@ import org.junit.jupiter.api.Test;
 
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.session.compaction.CompactionResult;
 import org.springframework.ai.session.compaction.SlidingWindowCompactionStrategy;
@@ -36,9 +37,9 @@ import org.springframework.context.annotation.Bean;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Integration tests for session lifecycle, event management, compaction strategies, and
- * multi-agent branch isolation — exercised end-to-end through a Spring Boot application
- * context with {@link DefaultSessionService} and {@link InMemorySessionRepository}.
+ * Integration tests for session lifecycle, event management and compaction strategies —
+ * exercised end-to-end through a Spring Boot application context with
+ * {@link DefaultSessionService} and {@link InMemorySessionRepository}.
  *
  * @author Christian Tzolov
  */
@@ -197,6 +198,24 @@ class SessionMemoryIT {
 	}
 
 	@Test
+	void storedSystemMessageSurvivesCompactionAndStaysFirst() {
+		Session session = this.sessionService.create(CreateSessionRequest.builder().userId("user-sys").build());
+		this.sessionService.appendMessage(session.id(), new SystemMessage("Answer in French."));
+		for (int i = 1; i <= 5; i++) {
+			this.sessionService.appendMessage(session.id(), new UserMessage("question " + i));
+			this.sessionService.appendMessage(session.id(), new AssistantMessage("answer " + i));
+		}
+
+		CompactionResult result = this.sessionService.compact(session.id(), req -> true,
+				SlidingWindowCompactionStrategy.builder().maxEvents(2).build());
+
+		assertThat(result.archivedEvents()).extracting(e -> e.getMessage().getText())
+			.doesNotContain("Answer in French.");
+		assertThat(this.sessionService.getActiveMessages(session.id())).extracting(Message::getText)
+			.containsExactly("Answer in French.", "question 5", "answer 5");
+	}
+
+	@Test
 	void turnWindowCompactionKeepsLastNTurns() {
 		Session session = this.sessionService.create(CreateSessionRequest.builder().userId("user-6").build());
 
@@ -218,6 +237,9 @@ class SessionMemoryIT {
 
 		// Archived turns are retained (not deleted) — full history still available
 		assertThat(this.sessionService.getMessages(session.id())).hasSize(10);
+		// ...while getActiveMessages() returns only the active window
+		assertThat(this.sessionService.getActiveMessages(session.id())).extracting(m -> m.getText())
+			.containsExactly("user turn 4", "assistant reply 4", "user turn 5", "assistant reply 5");
 	}
 
 	@Test
@@ -288,79 +310,6 @@ class SessionMemoryIT {
 		assertThat(syntheticCount).isEqualTo(2);
 	}
 
-	// --- Multi-agent branch isolation ---
-
-	@Test
-	void branchFilterIsolatesSiblingAgentEvents() {
-		Session session = this.sessionService.create(CreateSessionRequest.builder().userId("user-10").build());
-
-		// Root event (no branch) — visible to all
-		this.sessionService.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new UserMessage("orchestrator root task"))
-			.build());
-
-		// Researcher agent events
-		this.sessionService.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new UserMessage("research query"))
-			.branch("orch.researcher")
-			.build());
-		this.sessionService.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new AssistantMessage("research result"))
-			.branch("orch.researcher")
-			.build());
-
-		// Writer agent events (sibling — must NOT see researcher events)
-		this.sessionService.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new UserMessage("write task"))
-			.branch("orch.writer")
-			.build());
-		this.sessionService.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new AssistantMessage("written content"))
-			.branch("orch.writer")
-			.build());
-
-		// Researcher's view: sees root + own events, NOT writer's events
-		List<SessionEvent> researcherView = this.sessionService.getEvents(session.id(),
-				EventFilter.forBranch("orch.researcher"));
-		assertThat(researcherView).hasSize(3);
-		assertThat(researcherView).noneMatch(e -> "orch.writer".equals(e.getBranch()));
-
-		// Writer's view: sees root + own events, NOT researcher's events
-		List<SessionEvent> writerView = this.sessionService.getEvents(session.id(),
-				EventFilter.forBranch("orch.writer"));
-		assertThat(writerView).hasSize(3);
-		assertThat(writerView).noneMatch(e -> "orch.researcher".equals(e.getBranch()));
-	}
-
-	@Test
-	void branchFilterAncestorEventsVisibleToChildAgent() {
-		Session session = this.sessionService.create(CreateSessionRequest.builder().userId("user-11").build());
-
-		// Orchestrator-level event
-		this.sessionService.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new UserMessage("orch task"))
-			.branch("orch")
-			.build());
-
-		// Sub-researcher event
-		this.sessionService.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new AssistantMessage("sub result"))
-			.branch("orch.researcher")
-			.build());
-
-		// Deep child — can see both orch and orch.researcher events
-		List<SessionEvent> deepView = this.sessionService.getEvents(session.id(),
-				EventFilter.forBranch("orch.researcher.sub"));
-		assertThat(deepView).hasSize(2);
-	}
-
 	// --- Spring Boot configuration ---
 
 	@SpringBootConfiguration
@@ -373,7 +322,11 @@ class SessionMemoryIT {
 
 		@Bean
 		SessionService sessionService(SessionRepository sessionRepository) {
-			return DefaultSessionService.builder().sessionRepository(sessionRepository).build();
+			// Some tests store system messages on purpose (session setup).
+			return DefaultSessionService.builder()
+				.sessionRepository(sessionRepository)
+				.allowSystemMessages(true)
+				.build();
 		}
 
 	}

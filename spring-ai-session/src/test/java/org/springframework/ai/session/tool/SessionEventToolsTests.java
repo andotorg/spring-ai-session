@@ -180,6 +180,25 @@ class SessionEventToolsTests {
 		assertThat(result).contains("memory management");
 	}
 
+	@Test
+	void missingSessionIdReturnsErrorInsteadOfSearchingDefaultSession() {
+		Session defaultSession = this.sessionService
+			.create(CreateSessionRequest.builder().id("default").userId("other-user").build());
+		this.sessionService.appendMessage(defaultSession.id(), new UserMessage("secret from another user"));
+
+		String result = this.tools.conversationSearch("thinking...", "secret", 0, new ToolContext(Map.of()));
+
+		assertThat(result).isEqualTo(SessionEventTools.MISSING_SESSION_ID_RESULT);
+	}
+
+	@Test
+	void blankSessionIdReturnsError() {
+		String result = this.tools.conversationSearch("thinking...", "anything", 0,
+				new ToolContext(Map.of(SessionEventTools.SESSION_ID_CONTEXT_KEY, " ")));
+
+		assertThat(result).isEqualTo(SessionEventTools.MISSING_SESSION_ID_RESULT);
+	}
+
 	// --- helpers ---
 
 	private String search(String query, int page) {

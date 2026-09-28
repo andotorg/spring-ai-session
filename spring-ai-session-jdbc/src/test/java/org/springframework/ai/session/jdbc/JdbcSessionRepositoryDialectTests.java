@@ -16,9 +16,18 @@
 
 package org.springframework.ai.session.jdbc;
 
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.SQLException;
+
+import javax.sql.DataSource;
+
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
+import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.mock;
 
 /**
  * Unit tests for {@link JdbcSessionRepositoryDialect} implementations, focusing on
@@ -27,67 +36,44 @@ import static org.assertj.core.api.Assertions.assertThat;
 class JdbcSessionRepositoryDialectTests {
 
 	// -------------------------------------------------------------------------
-	// getBranchFilterFragment — PostgreSQL / H2 (default)
+	// from(DataSource) — detection
 	// -------------------------------------------------------------------------
 
 	@Test
-	void postgresBranchFilterUsesDoublePipeConcat() {
-		String fragment = new PostgresJdbcSessionRepositoryDialect().getBranchFilterFragment();
-		assertThat(fragment).contains("||");
-		assertThat(fragment).contains("e.branch IS NULL");
-		assertThat(fragment).contains("e.branch = ?");
+	void detectsSupportedDatabases() throws SQLException {
+		assertThat(JdbcSessionRepositoryDialect.from(dataSourceReporting("PostgreSQL")))
+			.isInstanceOf(PostgresJdbcSessionRepositoryDialect.class);
+		assertThat(JdbcSessionRepositoryDialect.from(dataSourceReporting("H2")))
+			.isInstanceOf(H2JdbcSessionRepositoryDialect.class);
+		assertThat(JdbcSessionRepositoryDialect.from(dataSourceReporting("MySQL")))
+			.isInstanceOf(MysqlJdbcSessionRepositoryDialect.class);
+		assertThat(JdbcSessionRepositoryDialect.from(dataSourceReporting("MariaDB")))
+			.isInstanceOf(MysqlJdbcSessionRepositoryDialect.class);
 	}
 
 	@Test
-	void h2BranchFilterUsesDoublePipeConcat() {
-		String fragment = new H2JdbcSessionRepositoryDialect().getBranchFilterFragment();
-		assertThat(fragment).contains("||");
-		assertThat(fragment).contains("e.branch IS NULL");
-		assertThat(fragment).contains("e.branch = ?");
-	}
-
-	// -------------------------------------------------------------------------
-	// getBranchFilterFragment — MySQL / MariaDB
-	// -------------------------------------------------------------------------
-
-	@Test
-	void mysqlBranchFilterUsesConcatFunction() {
-		String fragment = new MysqlJdbcSessionRepositoryDialect().getBranchFilterFragment();
-		assertThat(fragment).containsIgnoringCase("CONCAT(");
-		assertThat(fragment).contains("e.branch IS NULL");
-		assertThat(fragment).contains("e.branch = ?");
+	void unsupportedDatabaseFailsFast() throws SQLException {
+		DataSource oracle = dataSourceReporting("Oracle");
+		assertThatIllegalStateException().isThrownBy(() -> JdbcSessionRepositoryDialect.from(oracle))
+			.withMessageContaining("Oracle")
+			.withMessageContaining("dialect(");
 	}
 
 	@Test
-	void mysqlBranchFilterDoesNotUseDoublePipe() {
-		// || is logical OR in MySQL — using it would silently return wrong results
-		String fragment = new MysqlJdbcSessionRepositoryDialect().getBranchFilterFragment();
-		assertThat(fragment).doesNotContain("||");
+	void undeterminableDatabaseFailsFast() throws SQLException {
+		DataSource unreachable = mock(DataSource.class);
+		given(unreachable.getConnection()).willThrow(new SQLException("connection refused"));
+		assertThatIllegalStateException().isThrownBy(() -> JdbcSessionRepositoryDialect.from(unreachable));
 	}
 
-	@Test
-	void mysqlBranchFilterHasTwoPlaceholders() {
-		String fragment = new MysqlJdbcSessionRepositoryDialect().getBranchFilterFragment();
-		long count = fragment.chars().filter(c -> c == '?').count();
-		assertThat(count).as("branch filter must bind two parameters (exact match + LIKE)").isEqualTo(2);
-	}
-
-	// -------------------------------------------------------------------------
-	// Default method contract — all dialects must have two placeholders
-	// -------------------------------------------------------------------------
-
-	@Test
-	void allDialectsBranchFilterHaveTwoPlaceholders() {
-		for (JdbcSessionRepositoryDialect dialect : new JdbcSessionRepositoryDialect[] {
-				new PostgresJdbcSessionRepositoryDialect(),
-				new H2JdbcSessionRepositoryDialect(),
-				new MysqlJdbcSessionRepositoryDialect() }) {
-			String fragment = dialect.getBranchFilterFragment();
-			long count = fragment.chars().filter(c -> c == '?').count();
-			assertThat(count)
-				.as("dialect %s must bind exactly two parameters", dialect.getClass().getSimpleName())
-				.isEqualTo(2);
-		}
+	private static DataSource dataSourceReporting(String productName) throws SQLException {
+		DatabaseMetaData metaData = mock(DatabaseMetaData.class);
+		given(metaData.getDatabaseProductName()).willReturn(productName);
+		Connection connection = mock(Connection.class);
+		given(connection.getMetaData()).willReturn(metaData);
+		DataSource dataSource = mock(DataSource.class);
+		given(dataSource.getConnection()).willReturn(connection);
+		return dataSource;
 	}
 
 }

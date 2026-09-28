@@ -16,8 +16,8 @@
 
 package org.springframework.ai.session.compaction;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.function.ToIntFunction;
 
 import org.springframework.ai.session.SessionEvent;
 import org.springframework.ai.tokenizer.JTokkitTokenCountEstimator;
@@ -30,22 +30,23 @@ import org.springframework.util.Assert;
  *
  * <h3>Algorithm</h3>
  * <ol>
- * <li>Separate synthetic summary events — they are always preserved and placed first in
- * the result.</li>
- * <li>Compute a raw cut index based on root (non-branch) real events only. Branch events
- * produced by sub-agents do not consume slots from the {@code maxEvents} budget — they
- * are always included with their enclosing root turn.</li>
- * <li>Snap the raw cut index forward to the nearest root-level
+ * <li>Separate the latest stored system message (the system prompt — earlier stored
+ * system messages are superseded and archived; see
+ * {@code CompactionUtils#pinnedSystemEvents}) and synthetic summary events — they are
+ * always preserved, in place, and do not consume slots from the
+ * {@code maxEvents} budget.</li>
+ * <li>Compute a raw cut index that keeps the last {@code maxEvents} real events.</li>
+ * <li>Snap the raw cut index forward to the nearest
  * {@link org.springframework.ai.chat.messages.MessageType#USER} event so the kept window
- * always starts at a turn boundary. Sub-agent USER messages are skipped because they are
- * turn-internal, not turn starts.</li>
- * <li>Return: {@code [synthetic summaries] + [kept real events]}.</li>
+ * always starts at a turn boundary.</li>
+ * <li>Return every event that is not archived, in its original log order.</li>
  * </ol>
  *
  * <h3>No-op condition</h3>
  * <p>
- * If the number of real events does not exceed the available slots no events are archived
- * and the session is returned unchanged.
+ * If the number of real events does not exceed the available slots no real events are
+ * archived and the session is returned unchanged. If superseded stored system messages are present, only those are
+ * archived.
  *
  * @author Christian Tzolov
  * @since 2.0.0
@@ -74,58 +75,38 @@ public final class SlidingWindowCompactionStrategy implements CompactionStrategy
 
 		List<SessionEvent> events = context.events();
 
-		// Separate synthetic summary events (always preserved, always first)
+		// Separate the latest stored system message (the system prompt — kept where it was
+		// stored), superseded earlier ones (archived), and synthetic summary events (always
+		// preserved) from the real conversation events the window applies to.
+		List<SessionEvent> pinnedSystem = CompactionUtils.pinnedSystemEvents(events);
+		List<SessionEvent> supersededSystem = CompactionUtils.supersededSystemEvents(events, pinnedSystem);
 		List<SessionEvent> synthetic = events.stream().filter(SessionEvent::isSynthetic).toList();
-		List<SessionEvent> real = events.stream().filter(e -> !e.isSynthetic()).toList();
+		List<SessionEvent> real = CompactionUtils.compactableEvents(events);
+		ToIntFunction<SessionEvent> tokens = e -> this.tokenCountEstimator.estimate(CompactionUtils.formatEvent(e));
 
-		// maxEvents controls the real-events window only; synthetic summary events are
-		// always preserved on top and do not consume slots from the real-event budget.
-		// Branch events produced inside sub-agent sessions also do not consume slots —
-		// they are always included with their enclosing root turn.
-		int slotsForReal = this.maxEvents;
-
-		// Count only root (non-branch) real events to determine whether compaction is needed
-		// and where to place the raw cut. Branch events tagged with a non-null branch are
-		// turn-internal and are always carried along with their enclosing root turn.
-		long rootEventCount = real.stream().filter(SessionEvent::isRootEvent).count();
-
-		// No-op if root events fit within the available slots
-		if (rootEventCount <= slotsForReal) {
-			return new CompactionResult(events, List.of(), 0);
+		// maxEvents controls the real-events window only; system and synthetic summary
+		// events are always preserved on top and do not consume slots from the budget.
+		// No-op if the real events fit within the available slots.
+		if (real.size() <= this.maxEvents) {
+			return CompactionUtils.unchangedExceptSuperseded(events, supersededSystem, tokens);
 		}
 
-		// Find the index in 'real' just after the last root event to archive.
-		// Walk forward counting root events; place the raw cut right after the
-		// (rootEventCount - slotsForReal)-th root event so snapToTurnStart can advance
-		// it to the next root-level USER event.
-		long rootEventsToArchive = rootEventCount - slotsForReal;
-		int rawCutIndex = 0;
-		long rootSeen = 0;
-		for (int i = 0; i < real.size(); i++) {
-			if (real.get(i).isRootEvent()) {
-				rootSeen++;
-				if (rootSeen == rootEventsToArchive) {
-					rawCutIndex = i + 1;
-					break;
-				}
-			}
-		}
+		// Raw cut: keep the last maxEvents real events
+		int rawCutIndex = real.size() - this.maxEvents;
 
 		// Snap forward to the nearest turn start (USER message) so we never keep a
 		// partial turn — e.g. an assistant reply without its originating user message.
-		int cutIndex = CompactionUtils.snapToTurnStart(real, rawCutIndex);
+		// If no later turn start exists (the newest turn alone exceeds the budget), keep
+		// that last turn rather than archiving the whole active window.
+		int cutIndex = CompactionUtils.retainLastTurn(real, CompactionUtils.snapToTurnStart(real, rawCutIndex));
 
-		List<SessionEvent> keptReal = new ArrayList<>(real.subList(cutIndex, real.size()));
 		List<SessionEvent> removedReal = real.subList(0, cutIndex);
+		if (removedReal.isEmpty()) {
+			return CompactionUtils.unchangedExceptSuperseded(events, supersededSystem, tokens);
+		}
 
-		List<SessionEvent> compacted = new ArrayList<>(synthetic);
-		compacted.addAll(keptReal);
-
-		int tokensRemoved = removedReal.stream()
-			.mapToInt(e -> this.tokenCountEstimator.estimate(CompactionUtils.formatEvent(e)))
-			.sum();
-
-		return new CompactionResult(compacted, removedReal, tokensRemoved);
+		// Everything else stays in the active window, in its original log order
+		return CompactionUtils.archiving(events, removedReal, supersededSystem, tokens);
 	}
 
 	public int getMaxEvents() {
@@ -146,11 +127,13 @@ public final class SlidingWindowCompactionStrategy implements CompactionStrategy
 		}
 
 		public Builder maxEvents(int maxEvents) {
+			Assert.isTrue(maxEvents > 0, "maxEvents must be greater than 0");
 			this.maxEvents = maxEvents;
 			return this;
 		}
 
 		public Builder tokenCountEstimator(TokenCountEstimator tokenCountEstimator) {
+			Assert.notNull(tokenCountEstimator, "tokenCountEstimator must not be null");
 			this.tokenCountEstimator = tokenCountEstimator;
 			return this;
 		}

@@ -36,6 +36,11 @@ public interface SessionService {
 
 	// Sessions
 
+	/**
+	 * Creates a new session. Uses {@link CreateSessionRequest#id()} when set, otherwise a
+	 * random UUID.
+	 * @throws IllegalStateException if a session with the requested id already exists
+	 */
 	Session create(CreateSessionRequest request);
 
 	@Nullable Session findById(String sessionId);
@@ -46,8 +51,8 @@ public interface SessionService {
 
 	/**
 	 * Deletes all sessions whose {@code expiresAt} is before {@code before}. Delegates
-	 * to {@link SessionRepository#findExpiredSessionIds(Instant)} then deletes each one.
-	 * Returns the number of sessions deleted.
+	 * to {@link SessionRepository#deleteExpiredSessions(Instant)}, which does not delete a
+	 * session whose TTL was extended concurrently. Returns the number of sessions deleted.
 	 * <p>
 	 * This method does not schedule itself — call it from a {@code @Scheduled} method,
 	 * a Quartz job, or any other scheduler:
@@ -65,11 +70,16 @@ public interface SessionService {
 	/**
 	 * Appends a {@link SessionEvent} to the session identified by
 	 * {@link SessionEvent#getSessionId()}.
+	 * @throws IllegalArgumentException if the event wraps a
+	 * {@link org.springframework.ai.chat.messages.SystemMessage} and the service does not
+	 * allow storing system messages (the default for {@link DefaultSessionService}; see
+	 * {@link DefaultSessionService.Builder#allowSystemMessages(boolean)})
 	 */
 	void appendEvent(SessionEvent event);
 
 	/**
 	 * Convenience shorthand: wraps the message in a {@link SessionEvent} and appends it.
+	 * Subject to the same system-message rule as {@link #appendEvent(SessionEvent)}.
 	 */
 	default void appendMessage(String sessionId, Message message) {
 		appendEvent(SessionEvent.builder().sessionId(sessionId).message(message).build());
@@ -84,11 +94,24 @@ public interface SessionService {
 	}
 
 	/**
-	 * Convenience: returns all events as a flat {@link Message} list, suitable for
-	 * passing directly to an LLM.
+	 * Convenience: returns the messages of <em>all</em> events as a flat {@link Message}
+	 * list, including events archived by compaction and any synthetic summaries. This is
+	 * the full recorded history, not a prompt: after compaction it contains both the
+	 * verbatim archived turns and their summary. Use {@link #getActiveMessages(String)}
+	 * for the context window to send to an LLM.
 	 */
 	default List<Message> getMessages(String sessionId) {
 		return getEvents(sessionId).stream().map(SessionEvent::getMessage).toList();
+	}
+
+	/**
+	 * Convenience: returns the messages of the <em>active</em> context window — events
+	 * archived by compaction are excluded, synthetic summaries are included — as a flat
+	 * {@link Message} list, suitable for passing directly to an LLM. Equivalent to
+	 * {@code getEvents(sessionId, EventFilter.active())} mapped to messages.
+	 */
+	default List<Message> getActiveMessages(String sessionId) {
+		return getEvents(sessionId, EventFilter.active()).stream().map(SessionEvent::getMessage).toList();
 	}
 
 	// Compaction
