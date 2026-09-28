@@ -26,9 +26,9 @@ import org.springframework.util.Assert;
  *
  * @param compactedEvents the new active window in log order: every event that is not
  * archived keeps its original position, and new events (such as a summary turn) appear
- * where they belong, before the next existing event.
- * {@link org.springframework.ai.session.SessionRepository#compactEvents} inserts each new
- * event immediately before the existing event that follows it here.
+ * where they belong, before the next existing event. {@link CompactionPlan#of} turns this
+ * into the write operations the repository applies: each new event is inserted
+ * immediately before the existing event that follows it here.
  * @param archivedEvents the events archived by this pass, in log order
  * @param tokensEstimatedSaved the estimated number of tokens removed from the active
  * window
@@ -45,8 +45,11 @@ public record CompactionResult(List<SessionEvent> compactedEvents, List<SessionE
 		archivedEvents = List.copyOf(archivedEvents);
 	}
 
-	/** Returns the number of events removed, derived from {@link #archivedEvents()}. */
-	public int eventsRemoved() {
+	/**
+	 * Returns the number of events this pass archived, i.e. {@code archivedEvents().size()}.
+	 * Archived events stay in the log; compaction never removes an event.
+	 */
+	public int archivedEventCount() {
 		return this.archivedEvents.size();
 	}
 

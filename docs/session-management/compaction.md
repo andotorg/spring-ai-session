@@ -14,7 +14,9 @@ to compact) and **strategies** (how to compact).
 ## Entry point
 
 `SessionService.compact()` is the single entry point. It evaluates the trigger first and
-only runs the strategy — and writes back to the repository — when the trigger fires:
+only runs the strategy when the trigger fires. The strategy's result is turned into a
+`CompactionPlan` (which events to archive and which new events to insert), and the repository applies
+that plan in one version-checked write; when the plan is empty, nothing is written.
 
 ```java
 // Compact when turn count exceeds 20, keeping the last 10 events
@@ -24,23 +26,24 @@ CompactionResult result = service.compact(
     SlidingWindowCompactionStrategy.builder().maxEvents(10).build()
 );
 
-System.out.println(result.eventsRemoved());        // derived: archivedEvents().size()
-System.out.println(result.compactedEvents());      // the kept event list
-System.out.println(result.archivedEvents());       // the archived (not deleted) event list
+System.out.println(result.archivedEventCount());   // derived: archivedEvents().size()
+System.out.println(result.compactedEvents());      // the new active window, in log order
+System.out.println(result.archivedEvents());       // the archived (not deleted) events
 System.out.println(result.tokensEstimatedSaved()); // rough token saving estimate
 
 // Compact unconditionally — pass an always-fire trigger
 service.compact(sessionId, req -> true, SlidingWindowCompactionStrategy.builder().maxEvents(10).build());
 ```
 
-- **Archived, not deleted.** Archived events leave the prompt but stay in the log, and
-  remain searchable through [Recall Storage](../recall-memory/recall-storage.md). The only events
-  compaction removes are superseded synthetic summaries, replaced by a newer summary that
-  builds on them. See [Event lifecycle](concepts.md#event-lifecycle).
+- **Archived, never deleted.** Archived events leave the prompt but stay in the log, and
+  remain searchable through [Recall Storage](../recall-memory/recall-storage.md). This
+  includes a synthetic summary that a newer summary replaces: it is archived like the
+  events it stood for. Compaction never removes an event from the log. See
+  [Event lifecycle](concepts.md#event-lifecycle).
 - **Concurrent writes are safe.** The write is version-checked: if another writer changed
   the log during the pass, compaction is silently skipped, and a no-op result skips the
   write entirely. See the [compaction pass sequence](compaction-internals.md#2-sequence-a-compaction-pass-end-to-end)
-  and the [JDBC concurrency diagram](compaction-internals.md#5-sequence-jdbc-compactevents-and-a-concurrent-append).
+  and the [JDBC concurrency diagram](compaction-internals.md#6-sequence-jdbc-applycompaction-and-a-concurrent-append).
 - **Stored system messages are configuration.** If you store them (opt-in), the latest one
   is always kept where it was stored, never summarized and not counted against `maxEvents` /
   `maxTurns` / `maxEventsToKeep`; earlier ones are archived on every pass. See
@@ -94,7 +97,8 @@ CompactionTrigger trigger = CompositeCompactionTrigger.anyOf(
 ## Compaction Strategies
 
 Strategies implement `CompactionStrategy` (a `@FunctionalInterface`). Each receives a
-`CompactionRequest` with the session and its active events, and returns what to keep.
+`CompactionRequest` with the session and its active events, and returns a
+`CompactionResult`: the new active window, in log order, and the events it archived.
 
 | Strategy | LLM call? | Context preserved | Best for |
 |---|---|---|---|
@@ -153,9 +157,9 @@ message.
 
 ### TurnWindowCompactionStrategy
 
-Keeps the last `N` complete turns (default `N` = `DEFAULT_MAX_TURNS` = 10). Unlike the
-sliding window, this never cuts inside a turn — it always archives whole user↔agent
-exchanges.
+Keeps the last `N` complete turns (default `N` = `DEFAULT_MAX_TURNS` = 10). Its limit is
+counted in turns rather than events, so the size of the active window follows the
+conversation's shape: ten short turns and ten tool-heavy turns both count as ten.
 
 ```java
 // keep the last 10 turns
@@ -198,7 +202,7 @@ The preserved events that are sent with the conversation take their tokens off
 remainingBudget = maxTokens − tokens(kept system message + synthetic summary events)
 ```
 
-[Worked example 6](compaction-internals.md#6-worked-examples-of-the-tricky-cases) walks
+[Worked example 6](compaction-internals.md#7-worked-examples-of-the-tricky-cases) walks
 through a budget with a stored system prompt.
 
 If the deducted events use up the whole budget (`remainingBudget ≤ 0`), for example a
@@ -241,8 +245,8 @@ RecursiveSummarizationCompactionStrategy strategy =
    stop without calling the LLM.
 2. Feed `[prior synthetic summaries] + [events to archive] + [overlap events]` to the LLM.
    Stored system messages are never included.
-3. Replace the archived events and the prior summaries with a new synthetic summary turn
-   `[USER shadow, ASSISTANT summary]`.
+3. Archive the summarized events and the prior summaries, and insert a new synthetic
+   summary turn `[USER shadow, ASSISTANT summary]` right before the active window.
 
 The **recursive** property: the `ASSISTANT` text from any prior synthetic summary is fed
 back to the LLM as `=== PRIOR SUMMARY ===` context, so each summary builds on its
@@ -277,13 +281,15 @@ rendering or multilingual summaries:
 RecursiveSummarizationCompactionStrategy strategy =
     RecursiveSummarizationCompactionStrategy.builder(chatClient)
         .maxEventsToKeep(10)
-        .eventFormatter(event -> switch (event.getMessage()) {
+        .eventFormatter(event -> {
             // ToolResponseMessage.getText() is null — render the response data instead
-            case ToolResponseMessage trm -> "Tool result: " + trm.getResponses()
-                .stream()
-                .map(ToolResponseMessage.ToolResponse::responseData)
-                .collect(Collectors.joining("; "));
-            default -> RecursiveSummarizationCompactionStrategy.formatEvent(event);
+            if (event.getMessage() instanceof ToolResponseMessage trm) {
+                return "Tool result: " + trm.getResponses()
+                    .stream()
+                    .map(ToolResponseMessage.ToolResponse::responseData)
+                    .collect(Collectors.joining("; "));
+            }
+            return RecursiveSummarizationCompactionStrategy.formatEvent(event);
         })
         .build();
 ```
@@ -293,8 +299,9 @@ RecursiveSummarizationCompactionStrategy strategy =
 ## Turn-boundary Safety
 
 All four strategies share a common safety rule: the kept window always starts at a
-`USER` message (apart from `TurnWindowCompactionStrategy`'s preamble, see above). The sliding-window, token-count and recursive-summarization strategies snap
-their cut point forward to the next such message (package-private `CompactionUtils.snapToTurnStart`);
+`USER` message (apart from `TurnWindowCompactionStrategy`'s preamble, see above). The
+sliding-window, token-count and recursive-summarization strategies snap their cut point
+forward to the next such message (package-private `CompactionUtils.snapToTurnStart`);
 `TurnWindowCompactionStrategy` gets the same result by grouping events into turns. This
 prevents keeping a tool result or assistant reply without the user message that started
 its turn.
