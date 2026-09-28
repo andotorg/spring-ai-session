@@ -80,7 +80,7 @@ class RecursiveSummarizationCompactionStrategyTests {
 
 		assertThat(result.compactedEvents()).hasSize(5);
 		assertThat(result.archivedEvents()).isEmpty();
-		assertThat(result.eventsRemoved()).isEqualTo(0);
+		assertThat(result.archivedEventCount()).isEqualTo(0);
 		verifyNoMoreInteractions(this.chatClient);
 	}
 
@@ -97,7 +97,7 @@ class RecursiveSummarizationCompactionStrategyTests {
 		CompactionResult result = strategy.compact(context);
 
 		assertThat(result.compactedEvents()).hasSize(5);
-		assertThat(result.eventsRemoved()).isEqualTo(0);
+		assertThat(result.archivedEventCount()).isEqualTo(0);
 		verifyNoMoreInteractions(this.chatClient);
 	}
 
@@ -144,11 +144,11 @@ class RecursiveSummarizationCompactionStrategyTests {
 		assertThat(result.archivedEvents()).hasSize(3);
 		assertThat(result.archivedEvents().stream().map(e -> e.getMessage().getText()).toList())
 			.containsExactly("msg-1", "msg-2", "msg-3");
-		assertThat(result.eventsRemoved()).isEqualTo(3);
+		assertThat(result.archivedEventCount()).isEqualTo(3);
 	}
 
 	@Test
-	void priorSyntheticSummaryIsReplacedButNotCountedAsArchived() {
+	void priorSyntheticSummaryIsReplacedAndArchived() {
 		RecursiveSummarizationCompactionStrategy strategy = RecursiveSummarizationCompactionStrategy
 			.builder(this.chatClient)
 			.maxEventsToKeep(2)
@@ -174,11 +174,10 @@ class RecursiveSummarizationCompactionStrategyTests {
 		CompactionRequest context = contextFor(events);
 		CompactionResult result = strategy.compact(context);
 
-		// archivedEvents contains only the real events that were summarized;
-		// prior synthetic events are implicitly replaced by the new summaryTurn and are
-		// NOT included in archivedEvents (consistent with other strategies).
-		assertThat(result.archivedEvents().stream().noneMatch(SessionEvent::isSynthetic)).isTrue();
-		assertThat(result.archivedEvents()).hasSize(2); // msg-1 and msg-2
+		// archivedEvents contains the real events that were summarized and the prior
+		// synthetic summary turn the new one replaces: nothing leaves the log.
+		assertThat(result.archivedEvents()).hasSize(4); // prior summary turn, msg-1 and msg-2
+		assertThat(result.archivedEvents().stream().filter(SessionEvent::isSynthetic)).hasSize(2);
 
 		// New synthetic summary turn (USER shadow + ASSISTANT summary) is first in
 		// compacted, followed by the last 2 real events.
@@ -331,7 +330,7 @@ class RecursiveSummarizationCompactionStrategyTests {
 		CompactionResult result = strategy.compact(contextFor(events));
 
 		assertThat(result.archivedEvents()).isEmpty();
-		assertThat(result.eventsRemoved()).isZero();
+		assertThat(result.archivedEventCount()).isZero();
 		assertThat(result.compactedEvents()).hasSize(5);
 	}
 
@@ -394,7 +393,7 @@ class RecursiveSummarizationCompactionStrategyTests {
 		CompactionResult result = strategy.compact(contextFor(events));
 
 		assertThat(result.archivedEvents()).isEmpty();
-		assertThat(result.eventsRemoved()).isZero();
+		assertThat(result.archivedEventCount()).isZero();
 	}
 
 	@Test

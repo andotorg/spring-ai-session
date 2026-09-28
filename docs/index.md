@@ -31,14 +31,15 @@ how the main types fit together.
 | **Session Auto-configuration** | `spring-ai-autoconfigure-session` | Spring Boot auto-configuration for `DefaultSessionService` (repository-agnostic) |
 | **Session JDBC Auto-configuration** | `spring-ai-autoconfigure-session-jdbc` | Spring Boot auto-configuration for the JDBC repository |
 | **Session JDBC Starter** | `spring-ai-starter-session-jdbc` | Spring Boot starter — one dependency for a fully wired JDBC session setup |
+| **Session Test** | `spring-ai-session-test` | `AbstractSessionRepositoryContractTests`: the repository contract tests, for custom backends |
 | **Session BOM** | `spring-ai-session-bom` | Bill of Materials for managing all module versions together |
 
 ---
 
 ## Key Features
 
-- **Full history kept** — compaction archives events in place instead of deleting them
-  (only superseded summaries are replaced), so the full history stays searchable
+- **Full history kept** — compaction archives events in place and never deletes them, so
+  the full history stays searchable
 - **Composable event filtering** — by message type, time range, single or multi-term
   keyword (`ANY`/`ALL`), regular expression, last-N, or pagination
 - **Four compaction strategies** out of the box:
@@ -47,8 +48,8 @@ how the main types fit together.
     - `TokenCountCompactionStrategy` — keep a token-budget-bounded suffix
     - `RecursiveSummarizationCompactionStrategy` — LLM-powered rolling summary
 - **Two compaction triggers** — turn count and token count (composable with OR semantics)
-- **Optimistic concurrency** — compare-and-swap `compactEvents` makes compaction safe under
-  concurrent requests without locking
+- **Optimistic concurrency** — compare-and-swap `applyCompaction` makes compaction safe
+  under concurrent requests without locking
 - **Multi-agent** — give each sub-agent its own session, with its own memory and
   compaction; see [Multi-Agent](session-management/multi-agent.md)
 - **Recall storage tools** — `conversation_search` keyword-searches the current session's

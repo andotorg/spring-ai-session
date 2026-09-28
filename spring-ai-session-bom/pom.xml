@@ -84,7 +84,7 @@
             </dependency>
             <dependency>
                 <groupId>org.springaicommunity</groupId>
-                <artifactId>spring-ai-session-mongodb</artifactId>
+                <artifactId>spring-ai-session-test</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
