@@ -20,6 +20,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -30,9 +31,11 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.MessageType;
+import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.session.EventFilter;
+import org.springframework.ai.session.EventFilter.MatchMode;
 import org.springframework.ai.session.Session;
 import org.springframework.ai.session.SessionEvent;
 import org.springframework.data.mongodb.core.MongoTemplate;
@@ -127,6 +130,29 @@ class MongoSessionRepositoryTests {
 	}
 
 	@Test
+	void saveUpsertPreservesCreatedAt() {
+		Session session = buildSession("user-created-at");
+		this.repository.save(session);
+
+		this.repository.save(Session.builder()
+			.id(session.id())
+			.userId(session.userId())
+			.metadata(java.util.Map.of("updated", true))
+			.build());
+
+		assertThat(this.repository.findById(session.id()).createdAt().toEpochMilli())
+			.isEqualTo(session.createdAt().toEpochMilli());
+	}
+
+	@Test
+	void saveIfAbsentNeverOverwritesAnExistingSession() {
+		String id = UUID.randomUUID().toString();
+		assertThat(this.repository.saveIfAbsent(Session.builder().id(id).userId("alice").build())).isTrue();
+		assertThat(this.repository.saveIfAbsent(Session.builder().id(id).userId("mallory").build())).isFalse();
+		assertThat(this.repository.findById(id).userId()).isEqualTo("alice");
+	}
+
+	@Test
 	void findByIdReturnsNullWhenNotFound() {
 		assertThat(this.repository.findById("no-such-id")).isNull();
 	}
@@ -168,6 +194,24 @@ class MongoSessionRepositoryTests {
 		List<String> expiredIds = this.repository.findExpiredSessionIds(Instant.now());
 		assertThat(expiredIds).contains(expired.id());
 		assertThat(expiredIds).doesNotContain(active.id());
+	}
+
+	@Test
+	void deleteExpiredSessionsDeletesOnlyExpiredSessionsAndTheirEvents() {
+		Session active = buildSession("user-active");
+		Session expired = Session.builder()
+			.id(UUID.randomUUID().toString())
+			.userId("user-expired")
+			.expiresAt(Instant.now().minusSeconds(60))
+			.build();
+		this.repository.save(active);
+		this.repository.save(expired);
+		this.repository.appendEvent(SessionEvent.builder().sessionId(expired.id()).message(new UserMessage("old")).build());
+
+		assertThat(this.repository.deleteExpiredSessions(Instant.now())).isEqualTo(1);
+		assertThat(this.repository.findById(active.id())).isNotNull();
+		assertThat(this.repository.findById(expired.id())).isNull();
+		assertThat(this.repository.findEvents(expired.id(), EventFilter.all())).isEmpty();
 	}
 
 	// -------------------------------------------------------------------------
@@ -277,6 +321,29 @@ class MongoSessionRepositoryTests {
 		List<SessionEvent> results = this.repository.findEvents(session.id(), EventFilter.keywordSearch("hello"));
 		assertThat(results).hasSize(2);
 		assertThat(results).allMatch(e -> e.getMessage().getText().toLowerCase().contains("hello"));
+	}
+
+	@Test
+	void findEventsAppliesAllKeywordAndPatternFiltersBeforeSlicing() {
+		Session session = buildSession("user-advanced-filters");
+		this.repository.save(session);
+		this.repository.appendEvent(SessionEvent.builder().sessionId(session.id())
+			.message(new UserMessage("we decided to ship it")).build());
+		this.repository.appendEvent(SessionEvent.builder().sessionId(session.id())
+			.message(new UserMessage("actually, use this instead")).build());
+		this.repository.appendEvent(SessionEvent.builder().sessionId(session.id())
+			.message(new UserMessage("a.b is literal")).build());
+
+		assertThat(this.repository.findEvents(session.id(),
+				EventFilter.keywordsSearch(List.of("actually", "instead"), MatchMode.ALL)))
+			.extracting(event -> event.getMessage().getText())
+			.containsExactly("actually, use this instead");
+		assertThat(this.repository.findEvents(session.id(), EventFilter.patternSearch(Pattern.compile("\\bwe decided\\b"))))
+			.extracting(event -> event.getMessage().getText())
+			.containsExactly("we decided to ship it");
+		assertThat(this.repository.findEvents(session.id(), EventFilter.keywordSearch("a.b")))
+			.extracting(event -> event.getMessage().getText())
+			.containsExactly("a.b is literal");
 	}
 
 	@Test
@@ -491,38 +558,45 @@ class MongoSessionRepositoryTests {
 			.containsExactly("s2", "e3");
 	}
 
-	// -------------------------------------------------------------------------
-	// Branch filtering
-	// -------------------------------------------------------------------------
+	@Test
+	void compactEventsKeepsExistingEventsInTheirOriginalLogOrder() {
+		Session session = buildSession("user-compaction-order");
+		this.repository.save(session);
+		SessionEvent system = SessionEvent.builder().sessionId(session.id()).message(new SystemMessage("system")).build();
+		SessionEvent archived = SessionEvent.builder().sessionId(session.id()).message(new UserMessage("old")).build();
+		SessionEvent retained = SessionEvent.builder().sessionId(session.id()).message(new UserMessage("recent")).build();
+		this.repository.appendEvent(system);
+		this.repository.appendEvent(archived);
+		this.repository.appendEvent(retained);
+
+		assertThat(this.repository.compactEvents(session.id(), List.of(archived), List.of(system, retained),
+				this.repository.getEventVersion(session.id()))).isTrue();
+
+		assertThat(this.repository.findEvents(session.id(), EventFilter.all()))
+			.extracting(event -> event.getMessage().getText())
+			.containsExactly("system", "old", "recent");
+		assertThat(this.repository.findEvents(session.id(), EventFilter.all()).get(1).isArchived()).isTrue();
+	}
 
 	@Test
-	void findEventsWithBranchFilterIsolatesPeerAgents() {
-		Session session = buildSession("user-branch");
-		this.repository.save(session);
+	void appendEventIsIdempotentAndRejectsIdsOwnedByAnotherSession() {
+		Session first = buildSession("user-a");
+		Session second = buildSession("user-b");
+		this.repository.save(first);
+		this.repository.save(second);
+		SessionEvent event = SessionEvent.builder().id("stable-event-id").sessionId(first.id())
+			.message(new UserMessage("once")).build();
+		this.repository.appendEvent(event);
+		long version = this.repository.getEventVersion(first.id());
 
-		this.repository.appendEvent(
-				SessionEvent.builder().sessionId(session.id()).message(new UserMessage("root")).branch(null).build());
-		this.repository.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new UserMessage("by orchestrator"))
-			.branch("orch")
-			.build());
-		this.repository.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new UserMessage("by researcher"))
-			.branch("orch.researcher")
-			.build());
-		this.repository.appendEvent(SessionEvent.builder()
-			.sessionId(session.id())
-			.message(new UserMessage("by writer"))
-			.branch("orch.writer")
-			.build());
+		this.repository.appendEvent(event);
+		assertThat(this.repository.getEventVersion(first.id())).isEqualTo(version);
+		assertThat(this.repository.findEvents(first.id(), EventFilter.all())).hasSize(1);
 
-		List<SessionEvent> forResearcher = this.repository.findEvents(session.id(),
-				EventFilter.forBranch("orch.researcher"));
-
-		assertThat(forResearcher).hasSize(3);
-		assertThat(forResearcher).noneMatch(e -> "by writer".equals(e.getMessage().getText()));
+		SessionEvent duplicateInOtherSession = SessionEvent.builder().id(event.getId()).sessionId(second.id())
+			.message(new UserMessage("duplicate")).build();
+		assertThatThrownBy(() -> this.repository.appendEvent(duplicateInOtherSession))
+			.isInstanceOf(IllegalArgumentException.class);
 	}
 
 	// -------------------------------------------------------------------------

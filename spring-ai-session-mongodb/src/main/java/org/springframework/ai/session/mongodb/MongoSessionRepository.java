@@ -18,11 +18,12 @@ package org.springframework.ai.session.mongodb;
 
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.bson.Document;
 import org.jspecify.annotations.Nullable;
@@ -42,6 +43,7 @@ import org.springframework.ai.session.EventFilter;
 import org.springframework.ai.session.Session;
 import org.springframework.ai.session.SessionEvent;
 import org.springframework.ai.session.SessionRepository;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.mongodb.core.FindAndModifyOptions;
 import org.springframework.data.mongodb.core.MongoTemplate;
@@ -135,8 +137,6 @@ public final class MongoSessionRepository implements SessionRepository {
 
 	private static final String FIELD_ARCHIVED = "archived";
 
-	private static final String FIELD_BRANCH = "branch";
-
 	private static final String FIELD_SEQ = "seq";
 
 	private final MongoTemplate mongoTemplate;
@@ -156,11 +156,28 @@ public final class MongoSessionRepository implements SessionRepository {
 	public Session save(Session session) {
 		Assert.notNull(session, "session must not be null");
 		Update update = new Update().set(FIELD_USER_ID, session.userId())
-			.set(FIELD_CREATED_AT, toDate(session.createdAt()))
 			.set(FIELD_EXPIRES_AT, toDate(session.expiresAt()))
-			.set(FIELD_METADATA, session.metadata());
+			.set(FIELD_METADATA, session.metadata())
+			.setOnInsert(FIELD_CREATED_AT, toDate(session.createdAt()))
+			.setOnInsert(FIELD_EVENT_VERSION, 0L)
+			.setOnInsert(FIELD_EVENT_SEQ, 0L);
 		this.mongoTemplate.upsert(Query.query(Criteria.where(FIELD_ID).is(session.id())), update, COLLECTION_SESSIONS);
 		return session;
+	}
+
+	@Override
+	public boolean saveIfAbsent(Session session) {
+		Assert.notNull(session, "session must not be null");
+		Document doc = new Document(FIELD_ID, session.id()).append(FIELD_USER_ID, session.userId())
+			.append(FIELD_CREATED_AT, toDate(session.createdAt())).append(FIELD_EXPIRES_AT, toDate(session.expiresAt()))
+			.append(FIELD_METADATA, session.metadata()).append(FIELD_EVENT_VERSION, 0L).append(FIELD_EVENT_SEQ, 0L);
+		try {
+			this.mongoTemplate.insert(doc, COLLECTION_SESSIONS);
+			return true;
+		}
+		catch (DuplicateKeyException ex) {
+			return false;
+		}
 	}
 
 	@Override
@@ -197,6 +214,21 @@ public final class MongoSessionRepository implements SessionRepository {
 		this.mongoTemplate.remove(Query.query(Criteria.where(FIELD_SESSION_ID).is(sessionId)), COLLECTION_EVENTS);
 	}
 
+	@Override
+	public int deleteExpiredSessions(Instant before) {
+		Assert.notNull(before, "before must not be null");
+		List<String> candidates = findExpiredSessionIds(before);
+		int deleted = 0;
+		for (String sessionId : candidates) {
+			Query query = Query.query(Criteria.where(FIELD_ID).is(sessionId).and(FIELD_EXPIRES_AT).lt(toDate(before)));
+			if (this.mongoTemplate.remove(query, COLLECTION_SESSIONS).getDeletedCount() == 1) {
+				this.mongoTemplate.remove(Query.query(Criteria.where(FIELD_SESSION_ID).is(sessionId)), COLLECTION_EVENTS);
+				deleted++;
+			}
+		}
+		return deleted;
+	}
+
 	// -------------------------------------------------------------------------
 	// SessionRepository — event log
 	// -------------------------------------------------------------------------
@@ -206,6 +238,14 @@ public final class MongoSessionRepository implements SessionRepository {
 		Assert.notNull(event, "event must not be null");
 		String sessionId = event.getSessionId();
 		requireSessionExists(sessionId);
+		Document existing = this.mongoTemplate.findOne(Query.query(Criteria.where(FIELD_ID).is(event.getId())),
+				Document.class, COLLECTION_EVENTS);
+		if (existing != null) {
+			if (sessionId.equals(existing.getString(FIELD_SESSION_ID))) {
+				return;
+			}
+			throw new IllegalArgumentException("Event id already belongs to another session: " + event.getId());
+		}
 		// Atomically claim the next seq value and increment eventVersion in one shot.
 		Document updated = this.mongoTemplate.findAndModify(
 				Query.query(Criteria.where(FIELD_ID).is(sessionId)),
@@ -234,30 +274,42 @@ public final class MongoSessionRepository implements SessionRepository {
 		if (updated == null) {
 			return false;
 		}
-		// Read the previously-archived events (oldest prefix) so they survive the
-		// delete-and-reinsert. The whole log is rebuilt in order so the seq reflects the
-		// logical conversation order: previously-archived events, then newly-archived
-		// events, then the new active window (summary + recent).
-		List<SessionEvent> previouslyArchived = this.mongoTemplate
-			.find(Query.query(Criteria.where(FIELD_SESSION_ID).is(sessionId).and(FIELD_ARCHIVED).is(true))
-				.with(Sort.by(FIELD_SEQ).ascending()), Document.class, COLLECTION_EVENTS)
+		List<SessionEvent> log = this.mongoTemplate
+			.find(Query.query(Criteria.where(FIELD_SESSION_ID).is(sessionId)).with(Sort.by(FIELD_SEQ).ascending()),
+					Document.class, COLLECTION_EVENTS)
 			.stream()
 			.map(this::toSessionEvent)
 			.toList();
-		this.mongoTemplate.remove(Query.query(Criteria.where(FIELD_SESSION_ID).is(sessionId)), COLLECTION_EVENTS);
-		// Re-insert all events in order with new seq values: previously-archived, then
-		// newly-archived, then the new active window.
+		List<SessionEvent> compacted = compactedLog(sessionId, log, archivedEvents, retainedEvents);
+		Set<String> existingIds = new HashSet<>();
+		for (SessionEvent event : log) {
+			existingIds.add(event.getId());
+		}
+		Set<String> retainedIds = new HashSet<>();
+		for (SessionEvent event : compacted) {
+			retainedIds.add(event.getId());
+		}
+		List<String> deletedIds = log.stream()
+			.filter(event -> !event.isArchived() && !retainedIds.contains(event.getId()))
+			.map(SessionEvent::getId)
+			.toList();
+		if (!deletedIds.isEmpty()) {
+			this.mongoTemplate.remove(Query.query(Criteria.where(FIELD_SESSION_ID).is(sessionId).and(FIELD_ID).in(deletedIds)),
+					COLLECTION_EVENTS);
+		}
+
 		long seq = 0;
-		for (SessionEvent e : previouslyArchived) {
-			insertEvent(e, ++seq);
+		for (SessionEvent event : compacted) {
+			seq++;
+			if (existingIds.contains(event.getId())) {
+				this.mongoTemplate.updateFirst(
+						Query.query(Criteria.where(FIELD_ID).is(event.getId()).and(FIELD_SESSION_ID).is(sessionId)),
+						new Update().set(FIELD_ARCHIVED, event.isArchived()).set(FIELD_SEQ, seq), COLLECTION_EVENTS);
+			}
+			else {
+				insertEvent(event, seq);
+			}
 		}
-		for (SessionEvent e : archivedEvents) {
-			insertEvent(e.asArchived(), ++seq);
-		}
-		for (SessionEvent e : retainedEvents) {
-			insertEvent(e, ++seq);
-		}
-		// Set the seq counter to the last used value so the next appendEvent gets seq+1.
 		this.mongoTemplate.updateFirst(Query.query(Criteria.where(FIELD_ID).is(sessionId)),
 				new Update().set(FIELD_EVENT_SEQ, seq), COLLECTION_SESSIONS);
 		return true;
@@ -281,60 +333,13 @@ public final class MongoSessionRepository implements SessionRepository {
 		Assert.hasText(sessionId, "sessionId must not be null or empty");
 		Assert.notNull(filter, "filter must not be null");
 
-		List<Criteria> criteria = new ArrayList<>();
-		criteria.add(Criteria.where(FIELD_SESSION_ID).is(sessionId));
-
-		if (filter.from() != null) {
-			criteria.add(Criteria.where(FIELD_TIMESTAMP).gte(toDate(filter.from())));
-		}
-		if (filter.to() != null) {
-			criteria.add(Criteria.where(FIELD_TIMESTAMP).lte(toDate(filter.to())));
-		}
-		if (filter.messageTypes() != null && !filter.messageTypes().isEmpty()) {
-			criteria.add(Criteria.where(FIELD_MESSAGE_TYPE).in(filter.messageTypes().stream().map(MessageType::name).toList()));
-		}
-		if (filter.excludeSynthetic()) {
-			criteria.add(Criteria.where(FIELD_SYNTHETIC).is(false));
-		}
-		if (filter.excludeArchived()) {
-			criteria.add(Criteria.where(FIELD_ARCHIVED).is(false));
-		}
-		if (filter.branch() != null) {
-			// Visibility: null branch (root events) OR exact match OR caller is a
-			// descendant (filterBranch starts with eventBranch + '.')
-			criteria.add(new Criteria().orOperator(Criteria.where(FIELD_BRANCH).is(null),
-					Criteria.where(FIELD_BRANCH).is(filter.branch()),
-					Criteria.where(FIELD_BRANCH).regex("^" + java.util.regex.Pattern.quote(filter.branch()) + "\\.")));
-		}
-		if (filter.keyword() != null) {
-			criteria.add(Criteria.where(FIELD_MESSAGE_CONTENT).regex(filter.keyword(), "i"));
-		}
-
-		Query query = Query.query(new Criteria().andOperator(criteria.toArray(new Criteria[0])));
-
-		if (filter.lastN() != null) {
-			query.with(Sort.by(FIELD_SEQ).descending()).limit(filter.lastN());
-		}
-		else if (filter.pageSize() != null) {
-			int page = filter.page() != null ? filter.page() : 0;
-			query.with(Sort.by(FIELD_SEQ).ascending()).skip((long) page * filter.pageSize()).limit(filter.pageSize());
-		}
-		else {
-			query.with(Sort.by(FIELD_SEQ).ascending());
-		}
-
-		List<SessionEvent> result = this.mongoTemplate.find(query, Document.class, COLLECTION_EVENTS)
+		List<SessionEvent> events = this.mongoTemplate
+			.find(Query.query(Criteria.where(FIELD_SESSION_ID).is(sessionId)).with(Sort.by(FIELD_SEQ).ascending()),
+					Document.class, COLLECTION_EVENTS)
 			.stream()
 			.map(this::toSessionEvent)
 			.toList();
-
-		if (filter.lastN() != null) {
-			List<SessionEvent> reversed = new ArrayList<>(result);
-			Collections.reverse(reversed);
-			return Collections.unmodifiableList(reversed);
-		}
-
-		return Collections.unmodifiableList(result);
+		return applyFilter(events, filter);
 	}
 
 	// -------------------------------------------------------------------------
@@ -351,10 +356,81 @@ public final class MongoSessionRepository implements SessionRepository {
 			.append(FIELD_MESSAGE_DATA, messageDataToJson(msg))
 			.append(FIELD_SYNTHETIC, event.isSynthetic())
 			.append(FIELD_ARCHIVED, event.isArchived())
-			.append(FIELD_BRANCH, event.getBranch())
 			.append(FIELD_METADATA, event.getMetadata())
 			.append(FIELD_SEQ, seq);
 		this.mongoTemplate.insert(doc, COLLECTION_EVENTS);
+	}
+
+	private static List<SessionEvent> applyFilter(List<SessionEvent> events, EventFilter filter) {
+		List<SessionEvent> matched = events.stream().filter(filter::matches).toList();
+		if (filter.lastN() != null) {
+			int from = Math.max(0, matched.size() - filter.lastN());
+			return List.copyOf(matched.subList(from, matched.size()));
+		}
+		if (filter.pageSize() != null) {
+			long offset = (long) filter.page() * filter.pageSize();
+			if (offset >= matched.size()) {
+				return List.of();
+			}
+			int from = (int) offset;
+			int to = Math.min(from + filter.pageSize(), matched.size());
+			return List.copyOf(matched.subList(from, to));
+		}
+		return List.copyOf(matched);
+	}
+
+	private static List<SessionEvent> compactedLog(String sessionId, List<SessionEvent> log,
+			List<SessionEvent> archivedEvents, List<SessionEvent> retainedEvents) {
+		Set<String> logIds = new HashSet<>();
+		for (SessionEvent event : log) {
+			logIds.add(event.getId());
+		}
+		Set<String> archivedIds = new HashSet<>();
+		for (SessionEvent event : archivedEvents) {
+			if (!logIds.contains(event.getId())) {
+				throw new IllegalArgumentException(
+						"archivedEvents contains an event that is not in the log of session " + sessionId);
+			}
+			archivedIds.add(event.getId());
+		}
+		Set<String> retainedIds = new HashSet<>();
+		for (SessionEvent event : retainedEvents) {
+			retainedIds.add(event.getId());
+		}
+
+		Map<String, List<SessionEvent>> insertBefore = new HashMap<>();
+		List<SessionEvent> pending = new ArrayList<>();
+		for (SessionEvent event : retainedEvents) {
+			if (logIds.contains(event.getId())) {
+				if (!pending.isEmpty()) {
+					insertBefore.computeIfAbsent(event.getId(), ignored -> new ArrayList<>()).addAll(pending);
+					pending.clear();
+				}
+			}
+			else {
+				if (!sessionId.equals(event.getSessionId())) {
+					throw new IllegalArgumentException("retainedEvents contains a new event of session '"
+							+ event.getSessionId() + "', not of session " + sessionId);
+				}
+				pending.add(event);
+			}
+		}
+
+		List<SessionEvent> result = new ArrayList<>();
+		for (SessionEvent event : log) {
+			result.addAll(insertBefore.getOrDefault(event.getId(), List.of()));
+			if (event.isArchived()) {
+				result.add(event);
+			}
+			else if (archivedIds.contains(event.getId())) {
+				result.add(event.asArchived());
+			}
+			else if (retainedIds.contains(event.getId())) {
+				result.add(event);
+			}
+		}
+		result.addAll(pending);
+		return List.copyOf(result);
 	}
 
 	private void requireSessionExists(String sessionId) {
@@ -496,7 +572,6 @@ public final class MongoSessionRepository implements SessionRepository {
 			.sessionId(doc.getString(FIELD_SESSION_ID))
 			.timestamp(toInstant(doc.getDate(FIELD_TIMESTAMP)))
 			.message(message)
-			.branch(doc.getString(FIELD_BRANCH))
 			.archived(doc.getBoolean(FIELD_ARCHIVED, false))
 			.metadata(metadata)
 			.build();
